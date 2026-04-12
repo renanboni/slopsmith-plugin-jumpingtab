@@ -158,6 +158,135 @@
         });
     }
 
+    // ── Canvas lifecycle ─────────────────────────────────────
+    let active = false;
+    let canvas = null;
+    let ctx = null;
+    let raf = null;
+    let audioEl = null;
+
+    function sizeCanvasToHighway() {
+        const hw = document.getElementById('highway');
+        if (!hw || !canvas) return;
+        const w = hw.width || hw.clientWidth;
+        const h = hw.height || hw.clientHeight;
+        canvas.width = w;
+        canvas.height = h;
+        canvas.style.width = hw.style.width || (w + 'px');
+        canvas.style.height = hw.style.height || (h + 'px');
+    }
+
+    function mountCanvas() {
+        const player = document.getElementById('player');
+        const hw = document.getElementById('highway');
+        if (!player || !hw) return false;
+        canvas = document.createElement('canvas');
+        canvas.id = 'jumpingtab-canvas';
+        // Match tabview's mount pattern: append to #player, absolutely positioned
+        // at 0,0, sized to match #highway. This assumes #player is the positioned
+        // ancestor (which tabview relies on and is already proven to work).
+        canvas.style.cssText = [
+            'position:absolute',
+            'left:0',
+            'top:0',
+            'z-index:5',
+            'pointer-events:none',
+        ].join(';');
+        player.appendChild(canvas);
+        ctx = canvas.getContext('2d');
+        sizeCanvasToHighway();
+        hw.style.display = 'none';
+        audioEl = document.querySelector('audio');
+        window.addEventListener('resize', sizeCanvasToHighway);
+        return true;
+    }
+
+    function unmountCanvas() {
+        window.removeEventListener('resize', sizeCanvasToHighway);
+        if (canvas) { canvas.remove(); canvas = null; ctx = null; }
+        const hw = document.getElementById('highway');
+        if (hw) hw.style.display = '';
+        audioEl = null;
+    }
+
+    // ── Renderer (static parts only for this task) ───────────
+    function drawStaticBackground() {
+        if (!ctx || !canvas) return;
+        const W = canvas.width, H = canvas.height;
+        const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
+        const colors = colorsFor(nStrings);
+
+        // Background
+        ctx.fillStyle = '#0f1420';
+        ctx.fillRect(0, 0, W, H);
+
+        // String lines
+        ctx.strokeStyle = '#3a4358';
+        ctx.lineWidth = 1;
+        for (let s = 0; s < nStrings; s++) {
+            const y = stringY(s, H, nStrings);
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(W, y);
+            ctx.stroke();
+        }
+
+        // String labels on the left gutter
+        ctx.font = 'bold 11px monospace';
+        ctx.textBaseline = 'middle';
+        const labels = nStrings === 4 ? ['G','D','A','E'] : ['e','B','G','D','A','E'];
+        for (let s = 0; s < nStrings; s++) {
+            ctx.fillStyle = colors[s];
+            ctx.fillText(labels[s], 6, stringY(s, H, nStrings));
+        }
+
+        // Hit line with glow
+        const hitX = W * HIT_LINE_FRAC;
+        ctx.save();
+        ctx.shadowColor = '#6ee7ff';
+        ctx.shadowBlur = 16;
+        ctx.strokeStyle = '#6ee7ff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(hitX, 8);
+        ctx.lineTo(hitX, H - 8);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // ── Toggle + button ──────────────────────────────────────
+    function toggle() {
+        if (!active) {
+            if (!state.ready) {
+                console.warn('[jumpingtab] not ready — song data still loading');
+                return;
+            }
+            if (!mountCanvas()) return;
+            active = true;
+            drawStaticBackground(); // will become drawFrame in later tasks
+            const b = document.getElementById('btn-jt');
+            if (b) b.className = 'px-3 py-1.5 bg-cyan-900/50 rounded-lg text-xs text-cyan-300 transition';
+        } else {
+            active = false;
+            unmountCanvas();
+            const b = document.getElementById('btn-jt');
+            if (b) b.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
+        }
+    }
+
+    function injectBtn() {
+        const c = document.getElementById('player-controls');
+        if (!c || document.getElementById('btn-jt')) return;
+        const last = c.querySelector('button:last-child');
+        const b = document.createElement('button');
+        b.id = 'btn-jt';
+        b.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
+        b.textContent = 'Jumping Tab';
+        b.title = 'Toggle Yousician-style jumping tab view';
+        b.onclick = toggle;
+        c.insertBefore(b, last);
+    }
+
     // Expose for manual poking / future tests
     window.__jumpingtab_state = state;
     window.__jumpingtab_connect = connect;
@@ -166,6 +295,7 @@
     const _origPlay = window.playSong;
     window.playSong = async function (filename, arrangement) {
         await _origPlay(filename, arrangement);
+        injectBtn();
         try {
             await connect(filename, arrangement);
             console.log('[jumpingtab] loaded',
@@ -174,6 +304,15 @@
         } catch (e) {
             console.warn('[jumpingtab] connect failed:', e.message);
         }
+    };
+
+    const _origShow = window.showScreen;
+    window.showScreen = function (id) {
+        if (id !== 'player' && active) {
+            active = false;
+            unmountCanvas();
+        }
+        if (typeof _origShow === 'function') _origShow(id);
     };
 
     console.log('[jumpingtab] plugin loaded');
