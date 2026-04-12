@@ -123,7 +123,12 @@
 
             let total = null;
 
+            // Identity-gate all handlers: if the user picks a different song
+            // before this one finishes loading, state.ws is replaced. Old
+            // handlers continue firing — ignore them so they can't mutate
+            // the new song's state.
             ws.onmessage = (ev) => {
+                if (state.ws !== ws) return;
                 let msg;
                 try { msg = JSON.parse(ev.data); } catch (e) { return; }
                 if (msg.error) { reject(new Error(msg.error)); ws.close(); return; }
@@ -132,7 +137,7 @@
                 } else if (msg.type === 'notes') {
                     total = msg.total;
                     for (const n of msg.data) state.notes.push(n);
-                    if (state.notes.length >= total) {
+                    if (!state.ready && total != null && state.notes.length >= total) {
                         state.notes.sort((a, b) => a.t - b.t);
                         state.arcs = buildTrajectories(state.notes);
                         state.ready = true;
@@ -142,8 +147,14 @@
                     }
                 }
             };
-            ws.onerror = () => reject(new Error('ws error'));
-            ws.onclose = () => { if (!state.ready) reject(new Error('ws closed before ready')); };
+            ws.onerror = () => {
+                if (state.ws !== ws) return;
+                if (!state.ready) reject(new Error('ws error'));
+            };
+            ws.onclose = () => {
+                if (state.ws !== ws) return;
+                if (!state.ready) reject(new Error('ws closed before ready'));
+            };
         });
     }
 
