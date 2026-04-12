@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>jumpingtab tests</title>
+<style>
+  body { font-family: monospace; padding: 1em; background: #111; color: #eee; }
+  .ok { color: #6f6 } .fail { color: #f66 }
+  .group { margin: 1em 0; padding: .5em; border: 1px solid #333; }
+</style></head>
+<body>
+<h1>jumpingtab test harness</h1>
+<div id="out"></div>
+<script src="../screen.js"></script>
+<script>
+const out = document.getElementById('out');
+const core = window.__jumpingtab_core;
+let pass = 0, fail = 0;
+
+function group(name) {
+  const g = document.createElement('div');
+  g.className = 'group';
+  g.innerHTML = `<strong>${name}</strong>`;
+  out.appendChild(g);
+  return g;
+}
+function check(g, name, cond, detail = '') {
+  const line = document.createElement('div');
+  line.className = cond ? 'ok' : 'fail';
+  line.textContent = (cond ? '✓ ' : '✗ ') + name + (detail ? ' — ' + detail : '');
+  g.appendChild(line);
+  if (cond) pass++; else { fail++; console.error('FAIL', name, detail); }
+}
+
+// ── stringY ──────────────────────────────────────────────
+const g1 = group('stringY');
+check(g1, 'guitar: 6 rows', core.stringY(0, 200, 6) < core.stringY(5, 200, 6));
+check(g1, 'guitar string 0 near top', core.stringY(0, 200, 6) < 60);
+check(g1, 'guitar string 5 near bottom', core.stringY(5, 200, 6) > 140);
+check(g1, 'bass: 4 rows', core.stringY(0, 200, 4) < core.stringY(3, 200, 4));
+check(g1, 'guitar rows evenly spaced',
+  Math.abs((core.stringY(1, 200, 6) - core.stringY(0, 200, 6)) -
+           (core.stringY(2, 200, 6) - core.stringY(1, 200, 6))) < 0.01);
+
+// ── timeX ────────────────────────────────────────────────
+const g2 = group('timeX');
+const W = 1000;
+const hit = W * 0.15; // HIT_LINE_FRAC
+check(g2, 'now note sits on hit line',
+  Math.abs(core.timeX(10, 10, W) - hit) < 0.5);
+check(g2, 'future note (1s ahead) is right of hit line',
+  core.timeX(11, 10, W) > hit);
+check(g2, 'AHEAD-second note at right edge',
+  Math.abs(core.timeX(10 + 2.8, 10, W) - W) < 1);
+check(g2, 'past note left of hit line',
+  core.timeX(9.8, 10, W) < hit);
+
+// ── binaryVisibleRange ───────────────────────────────────
+const g3 = group('binaryVisibleRange');
+const notes = [
+  { t: 0.0 }, { t: 0.5 }, { t: 1.0 }, { t: 1.5 }, { t: 2.0 },
+  { t: 2.5 }, { t: 3.0 }, { t: 3.5 }, { t: 4.0 }, { t: 4.5 },
+];
+let r = core.binaryVisibleRange(notes, 2.0);  // window [1.6, 4.8]
+check(g3, 'start index inclusive of 1.6', notes[r.start].t >= 1.6);
+check(g3, 'start is first in window',
+  r.start === 0 || notes[r.start - 1].t < 1.6);
+check(g3, 'end index exclusive of 4.8',
+  r.end === notes.length || notes[r.end].t > 4.8);
+check(g3, 'range not empty for 2.0', r.end > r.start);
+
+r = core.binaryVisibleRange(notes, -10);  // nothing visible
+check(g3, 'empty before all notes', r.end <= r.start);
+
+r = core.binaryVisibleRange(notes, 100);  // past end
+check(g3, 'empty after all notes', r.end <= r.start);
+
+// ── buildTrajectories ────────────────────────────────────
+const g4 = group('buildTrajectories');
+// monophonic run of 4 notes → 3 arcs
+let arcs = core.buildTrajectories([
+  { t: 0.0, s: 2, f: 5 },
+  { t: 0.5, s: 3, f: 7 },
+  { t: 1.0, s: 1, f: 3 },
+  { t: 1.5, s: 0, f: 0 },
+]);
+check(g4, 'monophonic run gives n-1 arcs', arcs.length === 3);
+check(g4, 'first arc t0/t1', arcs[0].t0 === 0.0 && arcs[0].t1 === 0.5);
+check(g4, 'first arc endpoints', arcs[0].s0 === 2 && arcs[0].s1 === 3);
+
+// chord in the middle breaks the run
+arcs = core.buildTrajectories([
+  { t: 0.0, s: 0, f: 3 },  // single
+  { t: 0.5, s: 2, f: 5 },  // chord note 1
+  { t: 0.5, s: 3, f: 5 },  // chord note 2
+  { t: 0.5, s: 4, f: 3 },  // chord note 3
+  { t: 1.0, s: 1, f: 7 },  // single
+]);
+check(g4, 'chord breaks arcs: expect 2', arcs.length === 2,
+  'got ' + arcs.length);
+check(g4, 'first arc ends at chord earliest string index',
+  arcs[0].t1 === 0.5);
+check(g4, 'second arc starts from chord',
+  arcs[1].t0 === 0.5 && arcs[1].t1 === 1.0);
+
+// two chords back to back → no arcs
+arcs = core.buildTrajectories([
+  { t: 0.0, s: 0, f: 3 }, { t: 0.0, s: 1, f: 5 },
+  { t: 0.5, s: 2, f: 5 }, { t: 0.5, s: 3, f: 7 },
+]);
+check(g4, 'back-to-back chords give 0 arcs', arcs.length === 0);
+
+// empty notes
+check(g4, 'empty array → 0 arcs', core.buildTrajectories([]).length === 0);
+
+// single note
+check(g4, 'single note → 0 arcs',
+  core.buildTrajectories([{ t: 1, s: 2, f: 5 }]).length === 0);
+
+// ── bezierPoint ──────────────────────────────────────────
+const g5 = group('bezierPoint');
+// quadratic bezier from (0,0) via control (50, -20) to (100, 0)
+const p0 = core.bezierPoint(0, 0, 50, -20, 100, 0, 0);
+const pMid = core.bezierPoint(0, 0, 50, -20, 100, 0, 0.5);
+const p1 = core.bezierPoint(0, 0, 50, -20, 100, 0, 1);
+check(g5, 'u=0 returns start', p0.x === 0 && p0.y === 0);
+check(g5, 'u=1 returns end', p1.x === 100 && p1.y === 0);
+check(g5, 'u=0.5 is x=50', Math.abs(pMid.x - 50) < 0.01);
+check(g5, 'u=0.5 is above the line (y < 0 with our control)',
+  pMid.y < 0, 'y=' + pMid.y);
+
+document.title = `${pass} pass / ${fail} fail`;
+document.body.insertAdjacentHTML('afterbegin',
+  `<h2 class="${fail ? 'fail' : 'ok'}">${pass} pass / ${fail} fail</h2>`);
+</script>
+</body>
+</html>
