@@ -2,11 +2,11 @@
     'use strict';
 
     // ── Constants ─────────────────────────────────────────────
-    const AHEAD = 4.5;       // seconds of future notes visible at once
-    const BEHIND = 0.4;
-    const HIT_LINE_FRAC = 0.15;
-    const FADE_SECONDS = 0.4;
-    const SQUASH_WINDOW_MS = 50;
+    const AHEAD = 8.0;       // seconds of future notes visible at once
+    const BEHIND = 1.2;      // seconds of past notes kept on screen (fading)
+    const HIT_LINE_FRAC = 0.18;
+    const FADE_SECONDS = 1.0;
+    const SQUASH_WINDOW_MS = 60;
     const TOP_PAD = 24;
     const BOTTOM_PAD = 24;
 
@@ -50,13 +50,17 @@
     }
 
     function buildTrajectories(notes) {
-        // Group notes by timestamp, preserving sort order.
-        // A "group" with size > 1 is a chord and breaks arc continuity.
+        // Group notes by (near-)timestamp, preserving sort order. A group
+        // with more than one note is a chord. We emit an arc between every
+        // two consecutive groups so the ball always has somewhere to go —
+        // chord→chord included. For chord endpoints we use the average
+        // string index (float) so the arc visually lands on the centroid
+        // of the chord stack rather than one arbitrary string.
         if (notes.length < 2) return [];
 
         // Server rounds note times to 3 decimal places (ms precision), so
-        // chord notes arrive with byte-identical floats. Use a small epsilon
-        // anyway so any rounding drift upstream still groups them.
+        // chord notes arrive with byte-identical floats. Keep a small
+        // epsilon so any rounding drift upstream still groups them.
         const EPS = 1e-4;
         const groups = [];
         let i = 0;
@@ -64,7 +68,16 @@
             const t = notes[i].t;
             let j = i;
             while (j < notes.length && Math.abs(notes[j].t - t) < EPS) j++;
-            groups.push({ t, notes: notes.slice(i, j) });
+            const slice = notes.slice(i, j);
+            let sSum = 0;
+            for (const n of slice) sSum += n.s;
+            groups.push({
+                t,
+                notes: slice,
+                sAvg: sSum / slice.length,
+                // Representative fret — used only for logging/debug
+                f: slice[0].f,
+            });
             i = j;
         }
 
@@ -72,10 +85,11 @@
         for (let k = 0; k < groups.length - 1; k++) {
             const a = groups[k];
             const b = groups[k + 1];
-            if (a.notes.length > 1 && b.notes.length > 1) continue;
-            const n0 = a.notes[0];
-            const n1 = b.notes[0];
-            arcs.push({ t0: n0.t, t1: n1.t, s0: n0.s, f0: n0.f, s1: n1.s, f1: n1.f });
+            arcs.push({
+                t0: a.t, t1: b.t,
+                s0: a.sAvg, f0: a.f,
+                s1: b.sAvg, f1: b.f,
+            });
         }
         return arcs;
     }

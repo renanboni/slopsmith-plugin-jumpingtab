@@ -84,7 +84,8 @@ let arcs = core.buildTrajectories([
 ]);
 check(g4, 'monophonic run gives n-1 arcs', arcs.length === 3);
 check(g4, 'first arc t0/t1', arcs[0].t0 === 0.0 && arcs[0].t1 === 0.5);
-check(g4, 'first arc endpoints', arcs[0].s0 === 2 && arcs[0].s1 === 3);
+// For singles, sAvg equals the note's string
+check(g4, 'first arc endpoints (single notes)', arcs[0].s0 === 2 && arcs[0].s1 === 3);
 
 // chord in the middle breaks the run
 arcs = core.buildTrajectories([
@@ -101,12 +102,16 @@ check(g4, 'first arc ends at chord earliest string index',
 check(g4, 'second arc starts from chord',
   arcs[1].t0 === 0.5 && arcs[1].t1 === 1.0);
 
-// two chords back to back → no arcs
+// two chords back to back → ONE arc connecting chord centroids
 arcs = core.buildTrajectories([
   { t: 0.0, s: 0, f: 3 }, { t: 0.0, s: 1, f: 5 },
   { t: 0.5, s: 2, f: 5 }, { t: 0.5, s: 3, f: 7 },
 ]);
-check(g4, 'back-to-back chords give 0 arcs', arcs.length === 0);
+check(g4, 'back-to-back chords give 1 arc', arcs.length === 1);
+// First chord centroid: (0+1)/2 = 0.5; second chord centroid: (2+3)/2 = 2.5
+check(g4, 'chord→chord arc uses centroid s',
+  Math.abs(arcs[0].s0 - 0.5) < 0.001 && Math.abs(arcs[0].s1 - 2.5) < 0.001,
+  's0=' + arcs[0].s0 + ' s1=' + arcs[0].s1);
 
 // empty notes
 check(g4, 'empty array → 0 arcs', core.buildTrajectories([]).length === 0);
