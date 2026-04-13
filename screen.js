@@ -247,6 +247,36 @@
         ctx.restore();
     }
 
+    function drawSustains(W, H, nStrings, colors, now) {
+        if (!state.ready || !state.notes.length) return;
+        const { start, end } = binaryVisibleRange(state.notes, now);
+        const tailHeight = 8;
+        for (let i = start; i < end; i++) {
+            const n = state.notes[i];
+            if (!n.sus || n.sus <= 0) continue;
+            if (n.s < 0 || n.s >= nStrings) continue;
+            const x0 = timeX(n.t, now, W);
+            const x1 = timeX(n.t + n.sus, now, W);
+            const y = stringY(n.s, H, nStrings);
+            ctx.save();
+            ctx.globalAlpha = 0.55;
+            ctx.fillStyle = colors[n.s];
+            // Rounded rect
+            const r = tailHeight / 2;
+            ctx.beginPath();
+            ctx.moveTo(x0 + r, y - r);
+            ctx.lineTo(x1 - r, y - r);
+            ctx.arcTo(x1, y - r, x1, y, r);
+            ctx.arcTo(x1, y + r, x1 - r, y + r, r);
+            ctx.lineTo(x0 + r, y + r);
+            ctx.arcTo(x0, y + r, x0, y, r);
+            ctx.arcTo(x0, y - r, x0 + r, y - r, r);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
     function drawNotes(W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
@@ -289,6 +319,7 @@
         const colors = colorsFor(nStrings);
 
         drawBackground(W, H, nStrings, colors);
+        drawSustains(W, H, nStrings, colors, now);
         drawNotes(W, H, nStrings, colors, now);
     }
 
