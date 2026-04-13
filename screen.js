@@ -167,15 +167,22 @@
     let raf = null;
     let audioEl = null;
 
-    function sizeCanvasToHighway() {
-        const hw = document.getElementById('highway');
-        if (!hw || !canvas) return;
-        const w = hw.width || hw.clientWidth;
-        const h = hw.height || hw.clientHeight;
-        canvas.width = w;
-        canvas.height = h;
-        canvas.style.width = hw.style.width || (w + 'px');
-        canvas.style.height = hw.style.height || (h + 'px');
+    // Size the backing store to the canvas's on-screen CSS pixels, respecting
+    // device pixel ratio so the result is crisp on retina. Called on mount
+    // and on window resize. The canvas itself takes its display size from
+    // CSS (flex: 1), so we only touch width/height and the ctx transform.
+    function sizeCanvasToBox() {
+        if (!canvas || !ctx) return;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const pxW = Math.max(1, Math.floor(rect.width * dpr));
+        const pxH = Math.max(1, Math.floor(rect.height * dpr));
+        if (canvas.width !== pxW || canvas.height !== pxH) {
+            canvas.width = pxW;
+            canvas.height = pxH;
+        }
+        // Draw in CSS-pixel coordinates regardless of DPR
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     function mountCanvas() {
@@ -184,28 +191,30 @@
         if (!player || !hw) return false;
         canvas = document.createElement('canvas');
         canvas.id = 'jumpingtab-canvas';
-        // Match tabview's mount pattern: append to #player, absolutely positioned
-        // at 0,0, sized to match #highway. This assumes #player is the positioned
-        // ancestor (which tabview relies on and is already proven to work).
+        // Insert the canvas as a flex sibling right after #highway, so it
+        // gets the same flex slot as #highway (above #player-controls, below
+        // #player-hud). Using flex: 1 + min-height: 0 mirrors #highway's
+        // own rules in static/style.css, so the layout engine does the
+        // sizing for us — no overlap with the controls or HUD.
         canvas.style.cssText = [
-            'position:absolute',
-            'left:0',
-            'top:0',
-            'z-index:5',
-            'pointer-events:none',
+            'flex:1',
+            'width:100%',
+            'min-height:0',
+            'display:block',
+            'background:#0f1420',
         ].join(';');
-        player.appendChild(canvas);
+        hw.insertAdjacentElement('afterend', canvas);
         ctx = canvas.getContext('2d');
-        sizeCanvasToHighway();
         hw.style.display = 'none';
         audioEl = document.querySelector('audio');
-        window.addEventListener('resize', sizeCanvasToHighway);
+        sizeCanvasToBox();
+        window.addEventListener('resize', sizeCanvasToBox);
         return true;
     }
 
     function unmountCanvas() {
         if (raf) { cancelAnimationFrame(raf); raf = null; }
-        window.removeEventListener('resize', sizeCanvasToHighway);
+        window.removeEventListener('resize', sizeCanvasToBox);
         if (canvas) { canvas.remove(); canvas = null; ctx = null; }
         const hw = document.getElementById('highway');
         if (hw) hw.style.display = '';
@@ -417,7 +426,11 @@
 
     function drawFrame(now) {
         if (!ctx || !canvas) return;
-        const W = canvas.width, H = canvas.height;
+        // Draw in CSS pixels (ctx transform already scales to DPR).
+        // canvas.clientWidth/Height reflect the layout-assigned size.
+        const W = canvas.clientWidth;
+        const H = canvas.clientHeight;
+        if (W === 0 || H === 0) return;
         const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
         const colors = colorsFor(nStrings);
 
