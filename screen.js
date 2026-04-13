@@ -160,7 +160,11 @@
                 else if (n.po) type = 'p';
                 else if (n.sl && n.sl > 0) type = 's';
                 if (type) {
-                    arcs.push({ t0: prev.t, t1: n.t, s: n.s, type, f0: prev.f, f1: n.f });
+                    arcs.push({
+                        t0: prev.t, t1: n.t, s: n.s, type,
+                        f0: prev.f, f1: n.f,
+                        n0: prev, n1: n,
+                    });
                     paired.add(prev);
                     paired.add(n);
                 }
@@ -198,6 +202,30 @@
             const finalize = () => {
                 if (state.ready) return;
                 state.notes.sort((a, b) => a.t - b.t);
+
+                // Precompute per-note neighbor gaps (in seconds) for
+                // same-string neighbors, so drawNotes can clamp the
+                // radius and avoid visual overlap in dense passages.
+                // Chord teammates share a timestamp — skip those via
+                // an epsilon check.
+                const lastIdxByString = new Map();
+                const EPS_T = 1e-4;
+                for (let i = 0; i < state.notes.length; i++) {
+                    const n = state.notes[i];
+                    n._gapL = Infinity;
+                    n._gapR = Infinity;
+                    const prevIdx = lastIdxByString.get(n.s);
+                    if (prevIdx != null) {
+                        const prev = state.notes[prevIdx];
+                        const gap = n.t - prev.t;
+                        if (gap > EPS_T) {
+                            n._gapL = gap;
+                            if (gap < prev._gapR) prev._gapR = gap;
+                        }
+                    }
+                    lastIdxByString.set(n.s, i);
+                }
+
                 state.arcs = buildTrajectories(state.notes);
                 const tech = buildTechniqueArcs(state.notes);
                 state.techArcs = tech.arcs;
@@ -622,6 +650,27 @@
         return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
     }
 
+    // Convert a gap in seconds to a gap in canvas pixels at the current
+    // time-to-x mapping. The lane spans AHEAD seconds from hitX to the
+    // right edge, so 1 second = (W - hitX) / AHEAD pixels.
+    function secondsToPx(seconds, W) {
+        const hitX = W * HIT_LINE_FRAC;
+        return seconds * (W - hitX) / AHEAD;
+    }
+
+    // Clamp a note radius to whatever fits between its same-string
+    // neighbors at the current scale, with a floor so very dense runs
+    // still render a visible dot rather than shrinking to nothing.
+    const MIN_NOTE_R = 6;
+    function clampByNeighbors(baseR, n, W) {
+        const gap = Math.min(n._gapL || Infinity, n._gapR || Infinity);
+        if (!isFinite(gap)) return baseR;
+        const gapPx = secondsToPx(gap, W);
+        // Leave a 3px visual gutter between adjacent notes
+        const maxR = Math.max(MIN_NOTE_R, gapPx / 2 - 3);
+        return Math.min(baseR, maxR);
+    }
+
     function drawSustains(W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
@@ -698,10 +747,8 @@
         const lo = now - BEHIND;
         const hi = now + AHEAD;
 
-        const R = 14;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.font = 'bold 13px "SF Mono", Menlo, monospace';
 
         for (const a of state.techArcs) {
             if (a.t1 < lo || a.t0 > hi) continue;
@@ -711,6 +758,13 @@
             const x1 = timeX(a.t1, now, W);
             const y = yFor(a.s, H, nStrings);
             const color = colors[a.s];
+
+            // Radius clamped by outer neighbors — capsule shouldn't overlap
+            // the note before (via n0._gapL) or after (via n1._gapR).
+            const leftClamp = a.n0 ? clampByNeighbors(NOTE_BASE_R, a.n0, W) : NOTE_BASE_R;
+            const rightClamp = a.n1 ? clampByNeighbors(NOTE_BASE_R, a.n1, W) : NOTE_BASE_R;
+            const R = Math.min(leftClamp, rightClamp);
+            ctx.font = 'bold ' + Math.round(R * 0.95) + 'px "SF Mono", Menlo, monospace';
 
             // Use the later note's time for fade so the capsule fades as
             // a unit when it's behind the hit line.
@@ -969,7 +1023,7 @@
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
             const color = colors[n.s];
-            const R = noteRadius(x, hitX, W);
+            const R = clampByNeighbors(noteRadius(x, hitX, W), n, W);
 
             let alpha = 1;
             const dt = now - n.t;
