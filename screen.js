@@ -2,13 +2,18 @@
     'use strict';
 
     // ── Constants ─────────────────────────────────────────────
-    const AHEAD = 8.0;       // seconds of future notes visible at once
-    const BEHIND = 1.2;      // seconds of past notes kept on screen (fading)
+    const AHEAD = 8.0;
+    const BEHIND = 1.2;
     const HIT_LINE_FRAC = 0.18;
     const FADE_SECONDS = 1.0;
     const SQUASH_WINDOW_MS = 60;
-    const TOP_PAD = 24;
-    const BOTTOM_PAD = 24;
+    const TOP_PAD = 60;           // room for header strip
+    const BOTTOM_PAD = 36;        // room for progress bar
+    const HIT_ZONE_WIDTH = 56;    // wide glowing strip around hit line
+    const EDGE_FADE_FRAC = 0.06;  // % of canvas width to fade at edges
+    const NOTE_BASE_R = 14;
+    const NOTE_MAX_R = 18;        // max radius at hit line
+    const HEADER_H = 36;
 
     const GUITAR_COLORS = ['#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
     const BASS_COLORS   = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff'];
@@ -130,6 +135,8 @@
         techArcs: [],
         techPaired: new Set(),
         beats: [],
+        sections: [],
+        songInfo: {},
         ready: false,
         ws: null,
     };
@@ -174,6 +181,8 @@
             state.techArcs = [];
             state.techPaired = new Set();
             state.beats = [];
+            state.sections = [];
+            state.songInfo = {};
             state.ready = false;
 
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -213,8 +222,16 @@
                 if (msg.error) { reject(new Error(msg.error)); ws.close(); return; }
                 if (msg.type === 'song_info') {
                     state.tuning = msg.tuning || [0,0,0,0,0,0];
+                    state.songInfo = {
+                        title: msg.title || '',
+                        artist: msg.artist || '',
+                        arrangement: msg.arrangement || '',
+                        duration: msg.duration || 0,
+                    };
                     const mode = state.tuning.length === 4 ? 'bass (4)' : 'guitar (6)';
                     console.log('[jumpingtab] arrangement:', msg.arrangement, '— mode:', mode);
+                } else if (msg.type === 'sections') {
+                    state.sections = msg.data || [];
                 } else if (msg.type === 'notes') {
                     // Single (non-chord) notes
                     for (const n of msg.data) state.notes.push(n);
@@ -344,21 +361,62 @@
         audioEl = null;
     }
 
+    // ── Section color palette (cycled) ──────────────────────
+    const SECTION_COLORS = [
+        'rgba(110, 231, 255, 0.10)',  // cyan
+        'rgba(183, 134, 255, 0.10)',  // purple
+        'rgba(107, 255, 149, 0.10)',  // green
+        'rgba(255, 194, 107, 0.10)',  // orange
+        'rgba(255, 107, 139, 0.10)',  // pink
+    ];
+
+    function currentSection(sections, now) {
+        if (!sections || !sections.length) return null;
+        let cur = null;
+        for (const sec of sections) {
+            if (sec.time <= now) cur = sec;
+            else break;
+        }
+        return cur;
+    }
+
     // ── Renderer ─────────────────────────────────────────────
     function drawBackground(W, H, nStrings, colors, now) {
-        // Base fill
-        ctx.fillStyle = '#0b1020';
+        // Base fill — rich navy with a soft radial vignette
+        ctx.fillStyle = '#070b18';
         ctx.fillRect(0, 0, W, H);
 
-        // Subtle horizontal gradient to add depth
-        const grad = ctx.createLinearGradient(0, 0, 0, H);
-        grad.addColorStop(0, 'rgba(110, 231, 255, 0.04)');
-        grad.addColorStop(0.5, 'rgba(0, 0, 0, 0)');
-        grad.addColorStop(1, 'rgba(110, 231, 255, 0.04)');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, W, H);
+        const topBand = TOP_PAD;
+        const botBand = H - BOTTOM_PAD;
+        const laneH = botBand - topBand;
 
-        // Beat / measure lines — vertical ticks keyed off state.beats
+        // Lane panel — slightly lighter, with rounded top/bottom so the
+        // strings sit inside a visible "tab strip"
+        const laneGrad = ctx.createLinearGradient(0, topBand, 0, botBand);
+        laneGrad.addColorStop(0, '#0d1428');
+        laneGrad.addColorStop(0.5, '#0a1024');
+        laneGrad.addColorStop(1, '#0d1428');
+        ctx.fillStyle = laneGrad;
+        ctx.fillRect(0, topBand, W, laneH);
+
+        // Section bands — subtle colored backgrounds keyed to their time range
+        if (state.sections && state.sections.length) {
+            const lo = now - BEHIND;
+            const hi = now + AHEAD;
+            for (let i = 0; i < state.sections.length; i++) {
+                const sec = state.sections[i];
+                const next = state.sections[i + 1];
+                const t0 = sec.time;
+                const t1 = next ? next.time : (state.songInfo.duration || t0 + 999);
+                if (t1 < lo || t0 > hi) continue;
+                const sx0 = timeX(t0, now, W);
+                const sx1 = timeX(t1, now, W);
+                ctx.fillStyle = SECTION_COLORS[i % SECTION_COLORS.length];
+                ctx.fillRect(sx0, topBand, sx1 - sx0, laneH);
+            }
+        }
+
+        // Beat / measure lines — thin verticals inside the lane
         if (state.beats && state.beats.length) {
             const lo = now - BEHIND;
             const hi = now + AHEAD;
@@ -366,55 +424,202 @@
                 if (b.time < lo || b.time > hi) continue;
                 const bx = timeX(b.time, now, W);
                 const isMeasure = b.measure != null && b.measure >= 0;
-                ctx.save();
-                ctx.strokeStyle = isMeasure ? 'rgba(200, 210, 230, 0.22)' : 'rgba(120, 130, 160, 0.12)';
+                ctx.strokeStyle = isMeasure ? 'rgba(200, 210, 240, 0.18)' : 'rgba(140, 150, 180, 0.08)';
                 ctx.lineWidth = isMeasure ? 1.5 : 1;
                 ctx.beginPath();
-                ctx.moveTo(bx, 6);
-                ctx.lineTo(bx, H - 6);
+                ctx.moveTo(bx, topBand + 4);
+                ctx.lineTo(bx, botBand - 4);
                 ctx.stroke();
-                ctx.restore();
             }
         }
 
-        // String lines — brighter than before, with per-string tint
+        // Hit zone — a vertical gradient strip centered on the hit line
+        const hitX = W * HIT_LINE_FRAC;
+        const zoneL = hitX - HIT_ZONE_WIDTH / 2;
+        const zoneR = hitX + HIT_ZONE_WIDTH / 2;
+        const zoneGrad = ctx.createLinearGradient(zoneL, 0, zoneR, 0);
+        zoneGrad.addColorStop(0, 'rgba(110, 231, 255, 0)');
+        zoneGrad.addColorStop(0.5, 'rgba(110, 231, 255, 0.18)');
+        zoneGrad.addColorStop(1, 'rgba(110, 231, 255, 0)');
+        ctx.fillStyle = zoneGrad;
+        ctx.fillRect(zoneL, topBand, HIT_ZONE_WIDTH, laneH);
+
+        // String lines — colored, drawn inside the lane
         ctx.lineWidth = 1.5;
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
-            ctx.strokeStyle = colors[s] + '55';  // semi-transparent string color
+            ctx.strokeStyle = colors[s] + '60';
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(W, y);
             ctx.stroke();
         }
 
-        // String labels on the left gutter with a dark pill behind them
-        ctx.font = 'bold 12px monospace';
+        // String labels on the left gutter
+        ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
         const labels = nStrings === 4 ? ['G','D','A','E'] : ['e','B','G','D','A','E'];
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
-            ctx.fillStyle = 'rgba(15, 20, 32, 0.85)';
+            ctx.fillStyle = 'rgba(15, 20, 32, 0.88)';
             ctx.beginPath();
-            ctx.arc(14, y, 9, 0, Math.PI * 2);
+            ctx.arc(16, y, 10, 0, Math.PI * 2);
             ctx.fill();
+            ctx.strokeStyle = colors[s] + '80';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
             ctx.fillStyle = colors[s];
-            ctx.fillText(labels[s], 14, y + 0.5);
+            ctx.fillText(labels[s], 16, y + 0.5);
         }
 
-        // Hit line — brighter, thicker, with a soft halo
-        const hitX = W * HIT_LINE_FRAC;
+        // Hit line — crisp bright line in the middle of the zone
         ctx.save();
         ctx.shadowColor = '#6ee7ff';
-        ctx.shadowBlur = 22;
-        ctx.strokeStyle = '#a6f0ff';
-        ctx.lineWidth = 3;
+        ctx.shadowBlur = 24;
+        ctx.strokeStyle = '#d6f6ff';
+        ctx.lineWidth = 2.5;
         ctx.beginPath();
-        ctx.moveTo(hitX, 6);
-        ctx.lineTo(hitX, H - 6);
+        ctx.moveTo(hitX, topBand);
+        ctx.lineTo(hitX, botBand);
         ctx.stroke();
         ctx.restore();
+    }
+
+    // Edge fade — draw dark gradients at the left and right edges so notes
+    // don't pop in/out. Called AFTER notes so it overlays everything in
+    // the lane area.
+    function drawEdgeFade(W, H) {
+        const topBand = TOP_PAD;
+        const botBand = H - BOTTOM_PAD;
+        const laneH = botBand - topBand;
+        const fadeW = W * EDGE_FADE_FRAC;
+
+        const leftGrad = ctx.createLinearGradient(0, 0, fadeW, 0);
+        leftGrad.addColorStop(0, 'rgba(7, 11, 24, 1)');
+        leftGrad.addColorStop(1, 'rgba(7, 11, 24, 0)');
+        ctx.fillStyle = leftGrad;
+        ctx.fillRect(0, topBand, fadeW, laneH);
+
+        const rightGrad = ctx.createLinearGradient(W - fadeW, 0, W, 0);
+        rightGrad.addColorStop(0, 'rgba(7, 11, 24, 0)');
+        rightGrad.addColorStop(1, 'rgba(7, 11, 24, 1)');
+        ctx.fillStyle = rightGrad;
+        ctx.fillRect(W - fadeW, topBand, fadeW, laneH);
+    }
+
+    // Header strip — song title / artist / arrangement / current section
+    function drawHeader(W, H, now) {
+        const info = state.songInfo || {};
+        const sec = currentSection(state.sections, now);
+
+        // Header background — dark strip across the top
+        const hdrGrad = ctx.createLinearGradient(0, 0, 0, HEADER_H);
+        hdrGrad.addColorStop(0, 'rgba(12, 16, 30, 0.95)');
+        hdrGrad.addColorStop(1, 'rgba(12, 16, 30, 0.6)');
+        ctx.fillStyle = hdrGrad;
+        ctx.fillRect(0, 0, W, HEADER_H);
+
+        // Left: title · artist
+        ctx.font = '600 13px -apple-system, system-ui, sans-serif';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#e6ecff';
+        const title = info.title || 'Unknown';
+        ctx.fillText(title, 16, HEADER_H / 2);
+
+        // Artist subtitle
+        const titleW = ctx.measureText(title).width;
+        ctx.font = '400 12px -apple-system, system-ui, sans-serif';
+        ctx.fillStyle = 'rgba(200, 210, 230, 0.55)';
+        if (info.artist) {
+            ctx.fillText('· ' + info.artist, 16 + titleW + 8, HEADER_H / 2);
+        }
+
+        // Right: arrangement badge + current section
+        ctx.textAlign = 'right';
+        if (sec) {
+            const label = sec.name || '';
+            ctx.font = 'bold 11px "SF Mono", Menlo, monospace';
+            const lw = ctx.measureText(label).width;
+            const bx = W - 16 - lw - 12;
+            ctx.fillStyle = 'rgba(110, 231, 255, 0.18)';
+            if (ctx.roundRect) {
+                ctx.beginPath();
+                ctx.roundRect(bx, HEADER_H / 2 - 10, lw + 16, 20, 10);
+                ctx.fill();
+            } else {
+                ctx.fillRect(bx, HEADER_H / 2 - 10, lw + 16, 20);
+            }
+            ctx.fillStyle = '#a6f0ff';
+            ctx.fillText(label, W - 24, HEADER_H / 2 + 1);
+        }
+
+        if (info.arrangement) {
+            ctx.font = '500 11px -apple-system, system-ui, sans-serif';
+            ctx.fillStyle = 'rgba(200, 210, 230, 0.55)';
+            const margin = sec ? (W - 16 - ctx.measureText((sec.name || '')).width - 32) : W - 16;
+            ctx.fillText(info.arrangement, margin, HEADER_H / 2);
+        }
+    }
+
+    // Progress bar along the bottom of the canvas
+    function drawProgress(W, H, now) {
+        const duration = (state.songInfo && state.songInfo.duration) || 0;
+        if (duration <= 0) return;
+
+        const barY = H - 22;
+        const barH = 6;
+        const barX = 16;
+        const barW = W - 32;
+
+        // Track
+        ctx.fillStyle = 'rgba(200, 210, 230, 0.12)';
+        if (ctx.roundRect) {
+            ctx.beginPath();
+            ctx.roundRect(barX, barY, barW, barH, barH / 2);
+            ctx.fill();
+        } else {
+            ctx.fillRect(barX, barY, barW, barH);
+        }
+
+        // Fill
+        const pct = Math.max(0, Math.min(1, now / duration));
+        const fillW = barW * pct;
+        const fillGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+        fillGrad.addColorStop(0, '#6ee7ff');
+        fillGrad.addColorStop(1, '#b786ff');
+        ctx.fillStyle = fillGrad;
+        if (ctx.roundRect) {
+            ctx.beginPath();
+            ctx.roundRect(barX, barY, fillW, barH, barH / 2);
+            ctx.fill();
+        } else {
+            ctx.fillRect(barX, barY, fillW, barH);
+        }
+
+        // Time labels
+        const fmt = (t) => {
+            const m = Math.floor(t / 60);
+            const s = Math.floor(t % 60);
+            return m + ':' + (s < 10 ? '0' + s : s);
+        };
+        ctx.font = '500 10px "SF Mono", Menlo, monospace';
+        ctx.fillStyle = 'rgba(200, 210, 230, 0.6)';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillText(fmt(now), barX, barY - 8);
+        ctx.textAlign = 'right';
+        ctx.fillText(fmt(duration), barX + barW, barY - 8);
+    }
+
+    // Distance-based radius: notes grow as they approach the hit line and
+    // shrink as they leave. Max at hitX, base at edges.
+    function noteRadius(x, hitX, W) {
+        const dxRight = Math.abs(x - hitX);
+        const span = Math.max(hitX, W - hitX);
+        const t = 1 - Math.min(1, dxRight / (span * 0.6));
+        return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
     }
 
     function drawSustains(W, H, nStrings, colors, now) {
@@ -658,13 +863,19 @@
         }
 
         ctx.save();
-        ctx.fillStyle = '#ffffff';
         ctx.shadowColor = '#6ee7ff';
-        ctx.shadowBlur = 14;
+        ctx.shadowBlur = 18;
         ctx.translate(p.x, p.y);
         ctx.scale(sx, sy);
+        // Layered ball: outer glow ring + inner bright core
+        ctx.fillStyle = 'rgba(166, 240, 255, 0.6)';
         ctx.beginPath();
-        ctx.arc(0, 0, 8, 0, Math.PI * 2);
+        ctx.arc(0, 0, 11, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(0, 0, 6, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
     }
@@ -745,24 +956,21 @@
     function drawNotes(W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
+        const hitX = W * HIT_LINE_FRAC;
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.font = 'bold 13px "SF Mono", Menlo, monospace';
-
-        const R = 14;  // fret-circle radius (was 12)
 
         for (let i = start; i < end; i++) {
             const n = state.notes[i];
             if (n.s < 0 || n.s >= nStrings) continue;
-            // Skip notes that belong to a technique pair — they are drawn
-            // as a fused capsule by drawTechniquePairs.
             if (state.techPaired && state.techPaired.has(n)) continue;
+
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
             const color = colors[n.s];
+            const R = noteRadius(x, hitX, W);
 
-            // Past-note fade: once x < hitX, fade over FADE_SECONDS of real time
             let alpha = 1;
             const dt = now - n.t;
             if (dt > 0) {
@@ -773,23 +981,37 @@
             ctx.save();
             ctx.globalAlpha = alpha;
 
-            // Soft glow halo
+            // Colored glow halo
             ctx.shadowColor = color;
-            ctx.shadowBlur = 10;
+            ctx.shadowBlur = 14;
             ctx.fillStyle = color;
             ctx.beginPath();
             ctx.arc(x, y, R, 0, Math.PI * 2);
             ctx.fill();
 
-            // Crisp outline (no shadow on stroke)
+            // Inner gradient for a subtle 3D feel
             ctx.shadowBlur = 0;
+            const innerGrad = ctx.createRadialGradient(
+                x - R * 0.3, y - R * 0.4, R * 0.1,
+                x, y, R
+            );
+            innerGrad.addColorStop(0, 'rgba(255, 255, 255, 0.45)');
+            innerGrad.addColorStop(0.5, 'rgba(255, 255, 255, 0)');
+            innerGrad.addColorStop(1, 'rgba(0, 0, 0, 0.25)');
+            ctx.fillStyle = innerGrad;
+            ctx.beginPath();
+            ctx.arc(x, y, R, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Crisp outline
             ctx.lineWidth = 2;
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
             ctx.beginPath();
             ctx.arc(x, y, R, 0, Math.PI * 2);
             ctx.stroke();
 
-            // Fret number — black on colored fill for contrast
+            // Fret number
+            ctx.font = 'bold ' + Math.round(R * 0.95) + 'px "SF Mono", Menlo, monospace';
             ctx.fillStyle = '#0a0f1c';
             ctx.fillText(String(n.f), x, y + 1);
             ctx.restore();
@@ -798,8 +1020,6 @@
 
     function drawFrame(now) {
         if (!ctx || !canvas) return;
-        // Draw in CSS pixels (ctx transform already scales to DPR).
-        // canvas.clientWidth/Height reflect the layout-assigned size.
         const W = canvas.clientWidth;
         const H = canvas.clientHeight;
         if (W === 0 || H === 0) return;
@@ -814,6 +1034,9 @@
         drawNotes(W, H, nStrings, colors, now);
         drawBends(W, H, nStrings, colors, now);
         drawBall(W, H, nStrings, colors, now);
+        drawEdgeFade(W, H);
+        drawHeader(W, H, now);
+        drawProgress(W, H, now);
     }
 
     function tick() {
