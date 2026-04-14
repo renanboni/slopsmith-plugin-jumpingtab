@@ -193,7 +193,7 @@
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             const qs = (arrangementIdx != null && arrangementIdx >= 0)
                 ? `?arrangement=${arrangementIdx}` : '';
-            const url = `${proto}//${location.host}/ws/highway/${encodeURIComponent(filename)}${qs}`;
+            const url = `${proto}//${location.host}/ws/highway/${decodeURIComponent(filename)}${qs}`;
             const ws = new WebSocket(url);
             state.ws = ws;
 
