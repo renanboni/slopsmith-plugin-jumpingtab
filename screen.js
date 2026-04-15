@@ -2,21 +2,22 @@
     'use strict';
 
     // ── Constants ─────────────────────────────────────────────
-    const AHEAD = 8.0;
+    const AHEAD = 5.5;
     const BEHIND = 1.2;
     const HIT_LINE_FRAC = 0.18;
     const FADE_SECONDS = 1.0;
     const SQUASH_WINDOW_MS = 60;
     const IMPACT_DURATION = 0.45;   // seconds — ring expansion after a note crosses the hit line
+    const DISABLE_RINGS = true;   // set to true to disable expanding rings on note hits
     const TOP_PAD = 60;           // room for header strip
     const BOTTOM_PAD = 36;        // room for progress bar
     const HIT_ZONE_WIDTH = 56;    // wide glowing strip around hit line
     const EDGE_FADE_FRAC = 0.06;  // % of canvas width to fade at edges
-    const NOTE_BASE_R = 14;
-    const NOTE_MAX_R = 18;        // max radius at hit line
+    const NOTE_BASE_R = 18;
+    const NOTE_MAX_R = 18;        // consistent radius for all notes
     const HEADER_H = 36;
 
-    const GUITAR_COLORS = ['#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
+    const GUITAR_COLORS = ['#ff6b8b', '#ffe66b', '#6bd5ff', '#ffa56b', '#6bff95', '#c56bff'];
     const BASS_COLORS   = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff'];
 
     // ── Pure helpers ──────────────────────────────────────────
@@ -187,13 +188,15 @@
             state.techPaired = new Set();
             state.beats = [];
             state.sections = [];
+            state.chords = [];
+            state.chordTemplates = [];
             state.songInfo = {};
             state.ready = false;
 
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             const qs = (arrangementIdx != null && arrangementIdx >= 0)
                 ? `?arrangement=${arrangementIdx}` : '';
-            const url = `${proto}//${location.host}/ws/highway/${encodeURIComponent(filename)}${qs}`;
+            const url = `${proto}//${location.host}/ws/highway/${decodeURIComponent(filename)}${qs}`;
             const ws = new WebSocket(url);
             state.ws = ws;
 
@@ -203,6 +206,7 @@
             const finalize = () => {
                 if (state.ready) return;
                 state.notes.sort((a, b) => a.t - b.t);
+                state.chords.sort((a, b) => a.t - b.t);
 
                 // Precompute per-note neighbor gaps (in seconds) for
                 // same-string neighbors, so drawNotes can clamp the
@@ -236,6 +240,8 @@
                     singleNotesCount, 'single notes +',
                     chordNotesCount, 'chord notes =',
                     state.notes.length, 'total,',
+                    state.chords.length, 'chords,',
+                    state.chordTemplates.length, 'templates,',
                     state.techArcs.length, 'technique arcs');
                 resolve(state);
             };
@@ -265,13 +271,15 @@
                     // Single (non-chord) notes
                     for (const n of msg.data) state.notes.push(n);
                     singleNotesCount = state.notes.length;
+                } else if (msg.type === 'chord_templates') {
+                    // Store chord templates as an array so IDs match chord events.
+                    state.chordTemplates = msg.data || [];
+                    console.log('[jumpingtab] received', state.chordTemplates.length, 'chord templates');
                 } else if (msg.type === 'chords') {
-                    // Chord events — each chord has its own time and a list of
-                    // notes {s, f, sus, ...}. Expand into individual notes by
-                    // promoting the chord's time onto every note. Keep the
-                    // technique flags (ho, po, sl, bn) so drawTechniqueArcs
-                    // and drawBends can find them.
-                    for (const c of msg.data) {
+                    // Store chord events (time-based) AND expand into individual notes.
+                    // Chord events: {t, id, hd, notes}
+                    state.chords = state.chords.concat(msg.data || []);
+                    for (const c of msg.data || []) {
                         for (const cn of c.notes) {
                             state.notes.push({
                                 t: c.t,
@@ -286,6 +294,7 @@
                             chordNotesCount++;
                         }
                     }
+                    console.log('[jumpingtab] received', (msg.data || []).length, 'chords');
                 } else if (msg.type === 'beats') {
                     // Store beats for measure-bar rendering in drawBackground
                     state.beats = msg.data || [];
@@ -307,8 +316,11 @@
 
     // ── Canvas lifecycle ─────────────────────────────────────
     let active = false;
-    let canvas = null;
     let wrap = null;
+    let noteCanvas = null;
+    let chordCanvas = null;
+    let noteCtx = null;
+    let chordCtx = null;
     let ctx = null;
     let raf = null;
     let audioEl = null;
@@ -326,17 +338,26 @@
     // and on window resize. The canvas itself takes its display size from
     // CSS (flex: 1), so we only touch width/height and the ctx transform.
     function sizeCanvasToBox() {
-        if (!canvas || !ctx) return;
-        const rect = canvas.getBoundingClientRect();
+        if (!noteCanvas || !noteCtx || !chordCanvas || !chordCtx) return;
+        const noteRect = noteCanvas.getBoundingClientRect();
+        const chordRect = chordCanvas.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
-        const pxW = Math.max(1, Math.floor(rect.width * dpr));
-        const pxH = Math.max(1, Math.floor(rect.height * dpr));
-        if (canvas.width !== pxW || canvas.height !== pxH) {
-            canvas.width = pxW;
-            canvas.height = pxH;
+
+        const notePxW = Math.max(1, Math.floor(noteRect.width * dpr));
+        const notePxH = Math.max(1, Math.floor(noteRect.height * dpr));
+        if (noteCanvas.width !== notePxW || noteCanvas.height !== notePxH) {
+            noteCanvas.width = notePxW;
+            noteCanvas.height = notePxH;
         }
-        // Draw in CSS-pixel coordinates regardless of DPR
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        noteCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        const chordPxW = Math.max(1, Math.floor(chordRect.width * dpr));
+        const chordPxH = Math.max(1, Math.floor(chordRect.height * dpr));
+        if (chordCanvas.width !== chordPxW || chordCanvas.height !== chordPxH) {
+            chordCanvas.width = chordPxW;
+            chordCanvas.height = chordPxH;
+        }
+        chordCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     function mountCanvas() {
@@ -344,36 +365,51 @@
         const hw = document.getElementById('highway');
         if (!player || !hw) return false;
 
-        // Wrapper takes the highway's flex slot and centers the canvas
-        // vertically + horizontally inside it. The canvas itself is a
-        // shorter horizontal strip (Yousician style) instead of filling
-        // the whole player area.
+        // Wrapper takes the highway's flex slot and stacks the chord and note canvases.
         wrap = document.createElement('div');
         wrap.id = 'jumpingtab-wrap';
         wrap.style.cssText = [
             'flex:1',
             'min-height:0',
             'display:flex',
+            'flex-direction:column',
             'align-items:center',
             'justify-content:center',
             'padding:0 24px',
+            'gap:12px',
         ].join(';');
 
-        canvas = document.createElement('canvas');
-        canvas.id = 'jumpingtab-canvas';
-        canvas.style.cssText = [
+        chordCanvas = document.createElement('canvas');
+        chordCanvas.id = 'jumpingtab-chord-canvas';
+        chordCanvas.style.cssText = [
             'width:100%',
             'max-width:1400px',
-            'height:min(42vh, 360px)',
+            'height:min(44vh, 360px)',
+            'display:block',
+            'background:#090f18',
+            'border-radius:10px',
+            'box-shadow:0 8px 24px rgba(0,0,0,0.3)',
+        ].join(';');
+
+        noteCanvas = document.createElement('canvas');
+        noteCanvas.id = 'jumpingtab-canvas';
+        noteCanvas.style.cssText = [
+            'width:100%',
+            'max-width:1400px',
+            'height:min(44vh, 360px)',
             'display:block',
             'background:#0f1420',
             'border-radius:10px',
             'box-shadow:0 8px 24px rgba(0,0,0,0.4)',
         ].join(';');
 
-        wrap.appendChild(canvas);
+        wrap.appendChild(chordCanvas);
+        wrap.appendChild(noteCanvas);
         hw.insertAdjacentElement('afterend', wrap);
-        ctx = canvas.getContext('2d');
+
+        chordCtx = chordCanvas.getContext('2d');
+        noteCtx = noteCanvas.getContext('2d');
+        ctx = noteCtx;
         hw.style.display = 'none';
         audioEl = document.querySelector('audio');
         sizeCanvasToBox();
@@ -384,7 +420,7 @@
     function unmountCanvas() {
         if (raf) { cancelAnimationFrame(raf); raf = null; }
         window.removeEventListener('resize', sizeCanvasToBox);
-        if (wrap) { wrap.remove(); wrap = null; canvas = null; ctx = null; }
+        if (wrap) { wrap.remove(); wrap = null; noteCanvas = null; chordCanvas = null; noteCtx = null; chordCtx = null; ctx = null; }
         const hw = document.getElementById('highway');
         if (hw) hw.style.display = '';
         audioEl = null;
@@ -488,7 +524,7 @@
         ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
-        const labels = nStrings === 4 ? ['G','D','A','E'] : ['e','B','G','D','A','E'];
+        const labels = nStrings === 4 ? ['E','A','D','G'] : ['E','A','D','G','B','e'];
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
             ctx.fillStyle = 'rgba(15, 20, 32, 0.88)';
@@ -959,13 +995,14 @@
 
             // Expanding ring: grows from noteR out to ~3.2x, alpha fades
             const baseR = 14;
-            const r = baseR * (1 + ease * 2.2);
+            const expansion = DISABLE_RINGS ? 0 : ease * 2.2;
+            const r = baseR * (1 + expansion);
             const alpha = (1 - p) * 0.85;
 
             ctx.save();
             ctx.globalAlpha = alpha;
             ctx.strokeStyle = color;
-            ctx.lineWidth = 3 - ease * 2;  // thick → thin
+            ctx.lineWidth = 3 - (DISABLE_RINGS ? 0 : ease * 2);  // thick → thin
             ctx.shadowColor = color;
             ctx.shadowBlur = 18;
             ctx.beginPath();
@@ -974,12 +1011,13 @@
 
             // Secondary inner ring in white for extra pop on fresh hits
             if (p < 0.5) {
+                const expansion2 = DISABLE_RINGS ? 0 : ease * 1.2;
                 ctx.globalAlpha = (1 - p * 2) * 0.6;
                 ctx.strokeStyle = '#ffffff';
                 ctx.shadowBlur = 10;
                 ctx.lineWidth = 2;
                 ctx.beginPath();
-                ctx.arc(hitX, y, baseR * (1 + ease * 1.2), 0, Math.PI * 2);
+                ctx.arc(hitX, y, baseR * (1 + expansion2), 0, Math.PI * 2);
                 ctx.stroke();
             }
 
@@ -1094,7 +1132,7 @@
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
             const color = colors[n.s];
-            const R = clampByNeighbors(noteRadius(x, hitX, W), n, W);
+            const R = clampByNeighbors(NOTE_MAX_R, n, W);
 
             let alpha = 1;
             const dt = now - n.t;
@@ -1143,10 +1181,371 @@
         }
     }
 
-    function drawFrame(now) {
-        if (!ctx || !canvas) return;
-        const W = canvas.clientWidth;
-        const H = canvas.clientHeight;
+    // ── Chord display ───────────────────────────────────────
+    function findActiveChord(chords, now) {
+        // Find the chord whose time is closest to now (most recently started)
+        let best = null;
+        for (const c of chords) {
+            if (c.t <= now && (!best || c.t > best.t)) {
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    function roundRect(ctx, x, y, width, height, radius) {
+        if (typeof radius === 'undefined') radius = 5;
+        if (typeof radius === 'number') radius = {tl: radius, tr: radius, br: radius, bl: radius};
+        const {tl, tr, br, bl} = radius;
+        ctx.beginPath();
+        ctx.moveTo(x + tl, y);
+        ctx.lineTo(x + width - tr, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + tr);
+        ctx.lineTo(x + width, y + height - br);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - br, y + height);
+        ctx.lineTo(x + bl, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - bl);
+        ctx.lineTo(x, y + tl);
+        ctx.quadraticCurveTo(x, y, x + tl, y);
+        ctx.closePath();
+    }
+
+    function drawChordDiagram(x, y, chordName, frets, nStrings) {
+        // Draw a miniature chord diagram (6 or 4 strings)
+        const diagW = 50;
+        const diagH = 60;
+        const stringSpacing = diagW / Math.max(3, nStrings - 1);
+        const fretH = 12;
+
+        // Background
+        ctx.fillStyle = 'rgba(20, 30, 50, 0.95)';
+        ctx.fillRect(x - diagW / 2, y, diagW, diagH + 20);
+
+        // Border
+        ctx.strokeStyle = 'rgba(110, 231, 255, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x - diagW / 2, y, diagW, diagH + 20);
+
+        // Chord name label
+        ctx.font = 'bold 11px "SF Mono"';
+        ctx.fillStyle = '#6ee7ff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(chordName, x, y + 2);
+
+        // Diagram top (nut or fret 1 indicator)
+        const diagTop = y + 18;
+
+        // Vertical string lines
+        ctx.strokeStyle = 'rgba(150, 160, 180, 0.6)';
+        ctx.lineWidth = 1;
+        for (let s = 0; s < nStrings; s++) {
+            const sx = x - diagW / 2 + 5 + (s * stringSpacing);
+            ctx.beginPath();
+            ctx.moveTo(sx, diagTop);
+            ctx.lineTo(sx, diagTop + 48);
+            ctx.stroke();
+        }
+
+        // Horizontal fret lines
+        ctx.strokeStyle = 'rgba(100, 110, 130, 0.4)';
+        ctx.lineWidth = 1;
+        for (let f = 0; f < 5; f++) {
+            const fy = diagTop + f * fretH;
+            ctx.beginPath();
+            ctx.moveTo(x - diagW / 2 + 5, fy);
+            ctx.lineTo(x - diagW / 2 + 5 + diagW - 10, fy);
+            ctx.stroke();
+        }
+
+        // Finger positions (dots on diagram)
+        if (frets && frets.length) {
+            ctx.fillStyle = 'rgba(107, 255, 149, 0.8)';
+            for (let s = 0; s < Math.min(nStrings, frets.length); s++) {
+                const fret = frets[s];
+                if (fret && fret > 0) {
+                    const sx = x - diagW / 2 + 5 + (s * stringSpacing);
+                    const fy = diagTop + fret * fretH - fretH / 2;
+                    ctx.beginPath();
+                    ctx.arc(sx, fy, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    // Fret number inside dot
+                    ctx.font = 'bold 7px monospace';
+                    ctx.fillStyle = '#0a0f1c';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(String(fret), sx, fy);
+                }
+            }
+            // X marks for muted strings
+            ctx.strokeStyle = 'rgba(255, 107, 139, 0.7)';
+            ctx.lineWidth = 1.5;
+            for (let s = 0; s < Math.min(nStrings, frets.length); s++) {
+                const fret = frets[s];
+                if (fret === 0 || fret === '0' || fret === null) {
+                    // Muted or open string might show as 0 or null
+                }
+            }
+        }
+    }
+
+    function drawChordDiagramBox(x, y, width, height, frets, fingers, nStrings) {
+        const stringCount = Math.min(nStrings, Math.max(4, frets.length));
+        const diagWidth = 140;
+        const diagHeight = 170;
+        const diagX = x + (width - diagWidth) / 2;
+        const diagY = y + 80;
+
+        const stringSpacing = diagWidth / Math.max(1, stringCount - 1);
+        const fretSpacing = diagHeight / 5;
+        const nutY = diagY;
+
+        chordCtx.strokeStyle = 'rgba(200, 220, 255, 0.6)';
+        chordCtx.lineWidth = 2.5;
+        for (let i = 0; i < stringCount; i++) {
+            const sx = diagX + i * stringSpacing;
+            chordCtx.beginPath();
+            chordCtx.moveTo(sx, nutY);
+            chordCtx.lineTo(sx, nutY + diagHeight);
+            chordCtx.stroke();
+        }
+
+        chordCtx.strokeStyle = 'rgba(180, 200, 240, 0.35)';
+        chordCtx.lineWidth = 1.5;
+        for (let f = 0; f <= 5; f++) {
+            const fy = nutY + f * fretSpacing;
+            chordCtx.beginPath();
+            chordCtx.moveTo(diagX, fy);
+            chordCtx.lineTo(diagX + diagWidth, fy);
+            chordCtx.stroke();
+        }
+
+        chordCtx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+        chordCtx.lineWidth = 4;
+        chordCtx.beginPath();
+        chordCtx.moveTo(diagX, nutY);
+        chordCtx.lineTo(diagX + diagWidth, nutY);
+        chordCtx.stroke();
+
+        chordCtx.textAlign = 'center';
+        chordCtx.textBaseline = 'middle';
+
+        for (let i = 0; i < stringCount; i++) {
+            const sx = diagX + i * stringSpacing;
+            const fret = frets[i];
+            const finger = fingers[i];
+            const topY = nutY - 20;
+
+            if (fret === 0) {
+                chordCtx.fillStyle = '#ffffff';
+                chordCtx.font = 'bold 18px "SF Mono", monospace';
+                chordCtx.fillText('○', sx, topY);
+            } else if (fret === -1 || fret === null || fret === undefined) {
+                chordCtx.fillStyle = '#ff6b8b';
+                chordCtx.font = 'bold 24px "SF Mono", monospace';
+                chordCtx.fillText('×', sx, topY);
+            }
+
+            if (typeof fret === 'number' && fret > 0 && fret <= 5) {
+                const fretY = nutY + fret * fretSpacing - fretSpacing / 2;
+                chordCtx.fillStyle = 'rgba(110, 231, 255, 0.95)';
+                chordCtx.beginPath();
+                chordCtx.arc(sx, fretY, 12, 0, Math.PI * 2);
+                chordCtx.fill();
+                chordCtx.fillStyle = '#08101c';
+                chordCtx.font = 'bold 14px monospace';
+                chordCtx.fillText(String(fret), sx, fretY);
+            }
+        }
+
+        for (let i = 0; i < stringCount; i++) {
+            const sx = diagX + i * stringSpacing;
+            const finger = fingers[i];
+            if (typeof finger === 'number' && finger >= 0) {
+                chordCtx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+                chordCtx.font = '600 13px "SF Mono", monospace';
+                chordCtx.fillText(String(finger), sx, nutY + diagHeight + 22);
+            }
+        }
+
+        const lowestFret = Math.min(...frets.filter((f) => typeof f === 'number' && f > 0));
+        if (isFinite(lowestFret) && lowestFret > 1) {
+            chordCtx.font = '500 12px "SF Mono", monospace';
+            chordCtx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            chordCtx.textAlign = 'left';
+            chordCtx.fillText(`${lowestFret}fr`, diagX - 32, nutY + fretSpacing * 2.5);
+        }
+    }
+
+    function drawChordBoxes(now) {
+        if (!chordCtx || !state.ready || !state.chords.length || !state.chordTemplates.length) return;
+        const W = chordCanvas.clientWidth;
+        const H = chordCanvas.clientHeight;
+
+        chordCtx.clearRect(0, 0, chordCanvas.width, chordCanvas.height);
+        chordCtx.fillStyle = 'rgba(6, 10, 18, 0.96)';
+        chordCtx.fillRect(0, 0, W, H);
+
+        const hitX = W * HIT_LINE_FRAC;
+        const tMin = now - BEHIND;
+        const tMax = now + AHEAD;
+        const visible = [];
+        for (const ch of state.chords) {
+            if (ch.t < tMin) continue;
+            if (ch.t > tMax) break;
+            visible.push(ch);
+        }
+        if (!visible.length) return;
+
+        // Deduplicate consecutive chords with the same name
+        const unique = [];
+        let lastChordName = null;
+        for (const ch of visible) {
+            const template = state.chordTemplates[ch.id];
+            const chordName = template?.name || `Chord ${ch.id}`;
+            if (chordName !== lastChordName) {
+                unique.push(ch);
+                lastChordName = chordName;
+            }
+        }
+
+        const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
+        const diagWidth = 140;
+        const diagHeight = 140;
+        const boxPadding = 24;
+
+        let activeIndex = -1;
+        for (let i = 0; i < unique.length; i++) {
+            if (unique[i].t <= now) activeIndex = i;
+            else break;
+        }
+        if (activeIndex < 0) activeIndex = 0;
+        const activeChord = unique[activeIndex];
+        const otherChords = unique.filter((_, idx) => idx !== activeIndex);
+
+        const renderChordBox = (ch, isCurrent) => {
+            const x = isCurrent ? hitX : timeX(ch.t, now, W);
+            if (x < -diagWidth - boxPadding) return;
+            if (x > W + boxPadding) return;
+
+            const template = state.chordTemplates[ch.id] || null;
+            if (!template) return;
+
+            const chordName = template.name || `Chord ${ch.id}`;
+            const frets = template.frets || [];
+            const fingers = template.fingers || [];
+            const stringCount = Math.min(nStrings, Math.max(4, frets.length));
+
+            const boxLeft = x - diagWidth / 2;
+            const boxTop = 12;
+
+            const dt = now - ch.t;
+            let alpha = 0.55;
+            if (ch === activeChord) {
+                alpha = 1;
+            } else if (dt > 0) {
+                alpha = Math.max(0, 1 - (dt / BEHIND));
+            }
+
+            chordCtx.save();
+            chordCtx.globalAlpha = alpha;
+            chordCtx.fillStyle = isCurrent ? 'rgba(20, 30, 45, 0.98)' : 'rgba(14, 20, 32, 0.75)';
+            roundRect(chordCtx, boxLeft - 8, boxTop - 8, diagWidth + 16, H - 16, 12);
+            chordCtx.fill();
+
+            if (isCurrent) {
+                chordCtx.strokeStyle = 'rgba(110, 231, 255, 0.4)';
+                chordCtx.lineWidth = 2;
+                chordCtx.stroke();
+            }
+
+            chordCtx.fillStyle = isCurrent ? '#ffffff' : 'rgba(200, 210, 230, 0.8)';
+            chordCtx.font = `${isCurrent ? 'bold ' : ''}14px "SF Mono", monospace`;
+            chordCtx.textAlign = 'center';
+            chordCtx.textBaseline = 'top';
+            chordCtx.fillText(chordName, x, boxTop + 10);
+
+            const diagY = boxTop + 40;
+            const stringSpacing = diagWidth / Math.max(1, stringCount - 1);
+            const fretSpacing = diagHeight / 5;
+            const nutY = diagY;
+
+            chordCtx.strokeStyle = 'rgba(200, 220, 255, 0.5)';
+            chordCtx.lineWidth = 2;
+            for (let i = 0; i < stringCount; i++) {
+                const sx = x - diagWidth / 2 + i * stringSpacing;
+                chordCtx.beginPath();
+                chordCtx.moveTo(sx, nutY);
+                chordCtx.lineTo(sx, nutY + diagHeight);
+                chordCtx.stroke();
+            }
+
+            chordCtx.strokeStyle = 'rgba(180, 200, 240, 0.25)';
+            chordCtx.lineWidth = 1;
+            for (let f = 0; f <= 5; f++) {
+                const fy = nutY + f * fretSpacing;
+                chordCtx.beginPath();
+                chordCtx.moveTo(x - diagWidth / 2, fy);
+                chordCtx.lineTo(x + diagWidth / 2, fy);
+                chordCtx.stroke();
+            }
+
+            chordCtx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            chordCtx.lineWidth = 3;
+            chordCtx.beginPath();
+            chordCtx.moveTo(x - diagWidth / 2, nutY);
+            chordCtx.lineTo(x + diagWidth / 2, nutY);
+            chordCtx.stroke();
+
+            for (let i = 0; i < stringCount; i++) {
+                const sx = x - diagWidth / 2 + i * stringSpacing;
+                const fret = frets[i];
+                const finger = fingers[i];
+                const topY = nutY - 18;
+
+                chordCtx.textAlign = 'center';
+                chordCtx.textBaseline = 'middle';
+
+                if (fret === 0) {
+                    chordCtx.fillStyle = '#ffffff';
+                    chordCtx.font = 'bold 16px "SF Mono", monospace';
+                    chordCtx.fillText('○', sx, topY);
+                } else if (fret === -1 || fret === null || fret === undefined) {
+                    chordCtx.fillStyle = '#ff6b8b';
+                    chordCtx.font = 'bold 20px "SF Mono", monospace';
+                    chordCtx.fillText('×', sx, topY);
+                }
+
+                if (typeof fret === 'number' && fret > 0 && fret <= 5) {
+                    const fretY = nutY + fret * fretSpacing - fretSpacing / 2;
+                    chordCtx.fillStyle = 'rgba(110, 231, 255, 0.95)';
+                    chordCtx.beginPath();
+                    chordCtx.arc(sx, fretY, 10, 0, Math.PI * 2);
+                    chordCtx.fill();
+                    chordCtx.fillStyle = '#08101c';
+                    chordCtx.font = 'bold 12px monospace';
+                    chordCtx.fillText(String(fret), sx, fretY);
+                }
+
+                if (typeof finger === 'number' && finger >= 0) {
+                    chordCtx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                    chordCtx.font = '600 11px "SF Mono", monospace';
+                    chordCtx.fillText(String(finger), sx, nutY + diagHeight + 16);
+                }
+            }
+            chordCtx.restore();
+        };
+
+        for (const ch of otherChords) {
+            renderChordBox(ch, false);
+        }
+        renderChordBox(activeChord, true);
+    }
+
+    function drawNoteFrame(now) {
+        if (!ctx || !noteCanvas) return;
+        const W = noteCanvas.clientWidth;
+        const H = noteCanvas.clientHeight;
         if (W === 0 || H === 0) return;
         const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
         const colors = colorsFor(nStrings);
@@ -1167,10 +1566,16 @@
         drawProgress(W, H, now);
     }
 
+    function drawChordFrame(now) {
+        if (!chordCanvas || !chordCtx) return;
+        drawChordBoxes(now);
+    }
+
     function tick() {
         if (!active) return;
         const now = audioEl ? audioEl.currentTime : 0;
-        drawFrame(now);
+        drawNoteFrame(now);
+        drawChordFrame(now);
         raf = requestAnimationFrame(tick);
     }
 
@@ -1220,8 +1625,10 @@
     // used by demo/ to generate screenshots without running slopsmith.
     window.__jumpingtab_demo = {
         setCanvas(cnv) {
-            canvas = cnv;
-            ctx = cnv.getContext('2d');
+            noteCanvas = cnv;
+            chordCanvas = null;
+            noteCtx = cnv.getContext('2d');
+            ctx = noteCtx;
             const dpr = window.devicePixelRatio || 1;
             const rect = cnv.getBoundingClientRect();
             cnv.width = Math.max(1, Math.floor(rect.width * dpr));
@@ -1256,7 +1663,9 @@
             state.techPaired = tech.paired;
             state.ready = true;
         },
-        drawFrame,
+        drawFrame: drawNoteFrame,
+        drawNoteFrame,
+        drawChordFrame,
     };
 
     // ── Hook installation ────────────────────────────────────
