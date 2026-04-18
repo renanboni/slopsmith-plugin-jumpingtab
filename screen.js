@@ -1434,6 +1434,12 @@
             const chordName = template.name || `Chord ${ch.id}`;
             const frets = template.frets || [];
             const fingers = template.fingers || [];
+
+            // Ignore chord diagrams with names starting with "Chord " and those with only empty nodes
+            if (chordName.startsWith('Chord ') || frets.every(f => f === 0 || f === -1 || f === null || f === undefined)) {
+                return;
+            }
+
             const stringCount = Math.min(nStrings, Math.max(4, frets.length));
 
             const boxLeft = x - diagWidth / 2;
