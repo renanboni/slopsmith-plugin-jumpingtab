@@ -1435,6 +1435,11 @@
             const frets = template.frets || [];
             const fingers = template.fingers || [];
 
+            // Calculate the minimum fret for positioning
+            const playedFrets = frets.filter(f => typeof f === 'number' && f > 0);
+            const minFret = playedFrets.length > 0 ? Math.min(...playedFrets) : 1;
+            const maxFret = playedFrets.length > 0 ? Math.max(...playedFrets) : 1;
+
             // Ignore chord diagrams with names starting with "Chord " and those with only empty nodes
             if (chordName.startsWith('Chord ') || frets.every(f => f === 0 || f === -1 || f === null || f === undefined)) {
                 return;
@@ -1469,7 +1474,8 @@
             chordCtx.font = `${isCurrent ? 'bold ' : ''}14px "SF Mono", monospace`;
             chordCtx.textAlign = 'center';
             chordCtx.textBaseline = 'top';
-            chordCtx.fillText(chordName, x, boxTop + 10);
+            const displayName = minFret > 1 && maxFret > 5 ? `${chordName} (${minFret}fr)` : chordName;
+            chordCtx.fillText(displayName, x, boxTop + 10);
 
             const diagY = boxTop + 40;
             const stringSpacing = diagWidth / Math.max(1, stringCount - 1);
@@ -1509,6 +1515,11 @@
                 const finger = fingers[i];
                 const topY = nutY - 18;
 
+                let relativeFret = null;
+                if (typeof fret === 'number' && fret > 0) {
+                    relativeFret = fret - minFret + 1;
+                }
+
                 chordCtx.textAlign = 'center';
                 chordCtx.textBaseline = 'middle';
 
@@ -1522,15 +1533,15 @@
                     chordCtx.fillText('×', sx, topY);
                 }
 
-                if (typeof fret === 'number' && fret > 0 && fret <= 5) {
-                    const fretY = nutY + fret * fretSpacing - fretSpacing / 2;
+                if (relativeFret !== null && relativeFret <= 5) {
+                    const fretY = nutY + relativeFret * fretSpacing - fretSpacing / 2;
                     chordCtx.fillStyle = 'rgba(110, 231, 255, 0.95)';
                     chordCtx.beginPath();
                     chordCtx.arc(sx, fretY, 10, 0, Math.PI * 2);
                     chordCtx.fill();
                     chordCtx.fillStyle = '#08101c';
                     chordCtx.font = 'bold 12px monospace';
-                    chordCtx.fillText(String(fret), sx, fretY);
+                    chordCtx.fillText(String(relativeFret), sx, fretY);
                 }
 
                 if (typeof finger === 'number' && finger >= 0) {
