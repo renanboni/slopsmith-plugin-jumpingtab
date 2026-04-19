@@ -1452,6 +1452,11 @@
             const boxTop = 12;
 
             const dt = now - ch.t;
+            const fadeOutAfter = 0.22; // seconds after hit line before disappearing
+            if (!isCurrent && (dt >= fadeOutAfter || boxLeft <= 0)) {
+                return;
+            }
+
             const approach = dt < 0
                 ? 1 - Math.min(-dt, AHEAD) / AHEAD
                 : Math.max(0, 1 - Math.min(dt, BEHIND) / BEHIND);
