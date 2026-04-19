@@ -377,6 +377,9 @@
             'justify-content:center',
             'padding:0 24px',
             'gap:12px',
+            'width:95%',
+            'height:95%',
+            'margin:0 auto',
         ].join(';');
 
         chordCanvas = document.createElement('canvas');
@@ -384,7 +387,8 @@
         chordCanvas.style.cssText = [
             'width:100%',
             'max-width:1400px',
-            'height:min(44vh, 360px)',
+            'flex:0.35',
+            'min-height:0',
             'display:block',
             'background:#090f18',
             'border-radius:10px',
@@ -396,7 +400,8 @@
         noteCanvas.style.cssText = [
             'width:100%',
             'max-width:1400px',
-            'height:min(44vh, 360px)',
+            'flex:0.65',
+            'min-height:0',
             'display:block',
             'background:#0f1420',
             'border-radius:10px',
@@ -1335,7 +1340,7 @@
             const sx = diagX + i * stringSpacing;
             const fret = frets[i];
             const finger = fingers[i];
-            const topY = nutY - 20;
+            const topY = nutY - 6;
 
             if (fret === 0) {
                 chordCtx.fillStyle = '#ffffff';
@@ -1521,7 +1526,7 @@
                 const sx = x - diagWidth / 2 + i * stringSpacing;
                 const fret = frets[i];
                 const finger = fingers[i];
-                const topY = nutY - 18;
+                const topY = nutY - 6;
 
                 let relativeFret = null;
                 if (typeof fret === 'number' && fret > 0) {
