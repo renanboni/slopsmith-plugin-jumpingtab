@@ -40,15 +40,18 @@ cd ..
 docker compose restart web
 ```
 
-Hard-reload the browser. A **Jumping Tab** button will appear in the player controls when a song is loaded.
+Hard-reload the browser. **Jumping Tab** appears in the main-player visualization picker (top-right of the player controls).
+
+This plugin implements slopsmith core's `setRenderer` contract (slopsmith#36), so it's a full-replacement renderer rather than a toggle overlay. Because Jumping Tab is arrangement-agnostic — it works on any tuning / arrangement — it doesn't declare `matchesArrangement`, so **Auto** mode won't pick it automatically; you select it manually from the picker.
 
 ## Use
 
 1. Pick a song from your library.
-2. Wait for the button to become enabled (song data loading).
-3. Click **Jumping Tab** — the 3D highway is replaced with the 2D tab view.
-4. Press play. Watch the ball hop.
-5. Click the button again to return to the standard highway.
+2. Open the visualization picker in the player controls and choose **Jumping Tab**.
+3. Press play. Watch the ball hop.
+4. Switch back by picking **Highway** (or any other viz) in the picker.
+
+Arrangement changes (Lead → Rhythm → Bass via the player dropdown) and difficulty-slider moves are detected automatically — the tab and trajectory arcs rebuild in place while Jumping Tab stays selected.
 
 ## What it doesn't do (yet)
 
