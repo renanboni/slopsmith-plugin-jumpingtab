@@ -47,8 +47,18 @@
     const HEADER_H = 36;
     const MIN_NOTE_R = 6;
 
-    const GUITAR_COLORS = ['#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
-    const BASS_COLORS   = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff'];
+    // Per-string colors. GUITAR_COLORS covers 6-string guitar +
+    // extended-range up to 8 strings (slopsmith-plugin-3dhighway#7);
+    // BASS_COLORS covers 4-string bass + 5-string bass (added 7th
+    // string color reused as the 5th bass color for warmth).
+    // Lookups still fall back to '#888' via the '|| ' guards in
+    // draw* functions.
+    const GUITAR_COLORS = [
+        '#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff',
+        '#ff6bd5', '#6bffe6',  // 7th = pink, 8th = aqua
+    ];
+    const BASS_COLORS = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
+    const FALLBACK_COLOR = '#888888';
 
     // ── Section color palette (cycled) ──────────────────────
     const SECTION_COLORS = [
@@ -72,7 +82,12 @@
     }
 
     function colorsFor(nStrings) {
-        return nStrings === 4 ? BASS_COLORS : GUITAR_COLORS;
+        // Bass arrangements (4 or 5 strings) use the warm BASS_COLORS
+        // palette; everything else (6, 7, 8 strings) uses the wider
+        // GUITAR_COLORS rainbow. Out-of-range indices (>= the chosen
+        // palette length) get a neutral gray fallback at lookup
+        // sites — the palette being short doesn't poison rendering.
+        return nStrings <= 5 ? BASS_COLORS : GUITAR_COLORS;
     }
 
     function timeX(t, now, width) {
@@ -424,7 +439,7 @@
         ctx.lineWidth = 1.5;
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
-            ctx.strokeStyle = colors[s] + '60';
+            ctx.strokeStyle = (colors[s] || FALLBACK_COLOR) + '60';
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(W, y);
@@ -434,18 +449,28 @@
         ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
-        const labels = nStrings === 4 ? ['G','D','A','E'] : ['e','B','G','D','A','E'];
+        // String labels for the small note-letter circles. Bass uses
+        // the standard 4 (E A D G); 5-string bass adds a low B; guitar
+        // uses 6 (low E to high e); 7-string adds a low B; 8-string
+        // adds a low F#. Lookups beyond the palette fall through to
+        // the empty string so the circle still draws (just unlabelled).
+        const labels = (nStrings === 4) ? ['G','D','A','E']
+                     : (nStrings === 5) ? ['G','D','A','E','B']
+                     : (nStrings === 6) ? ['e','B','G','D','A','E']
+                     : (nStrings === 7) ? ['e','B','G','D','A','E','B']
+                     :                    ['e','B','G','D','A','E','B','F#'];
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
+            const stringColor = colors[s] || FALLBACK_COLOR;
             ctx.fillStyle = 'rgba(15, 20, 32, 0.88)';
             ctx.beginPath();
             ctx.arc(16, y, 10, 0, Math.PI * 2);
             ctx.fill();
-            ctx.strokeStyle = colors[s] + '80';
+            ctx.strokeStyle = stringColor + '80';
             ctx.lineWidth = 1.5;
             ctx.stroke();
-            ctx.fillStyle = colors[s];
-            ctx.fillText(labels[s], 16, y + 0.5);
+            ctx.fillStyle = stringColor;
+            ctx.fillText(labels[s] || '', 16, y + 0.5);
         }
 
         ctx.save();
@@ -588,7 +613,7 @@
             const y = yFor(n.s, H, nStrings);
             ctx.save();
             ctx.globalAlpha = 0.55;
-            ctx.fillStyle = colors[n.s];
+            ctx.fillStyle = colors[n.s] || FALLBACK_COLOR;
             const r = tailHeight / 2;
             ctx.beginPath();
             ctx.moveTo(x0 + r, y - r);
@@ -619,7 +644,7 @@
             const x0 = timeX(a.t0, now, W);
             const x1 = timeX(a.t1, now, W);
             const y = yFor(a.s, H, nStrings);
-            const color = colors[a.s];
+            const color = colors[a.s] || FALLBACK_COLOR;
 
             const leftClamp = a.n0 ? clampByNeighbors(NOTE_BASE_R, a.n0, W) : NOTE_BASE_R;
             const rightClamp = a.n1 ? clampByNeighbors(NOTE_BASE_R, a.n1, W) : NOTE_BASE_R;
@@ -768,7 +793,7 @@
             const p = dt / IMPACT_DURATION;
             const ease = 1 - Math.pow(1 - p, 2);
             const y = yFor(n.s, H, nStrings);
-            const color = colors[n.s];
+            const color = colors[n.s] || FALLBACK_COLOR;
 
             const baseR = 14;
             const r = baseR * (1 + ease * 2.2);
@@ -890,7 +915,7 @@
 
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
-            const color = colors[n.s];
+            const color = colors[n.s] || FALLBACK_COLOR;
             const R = clampByNeighbors(noteRadius(x, hitX, W), n, W);
 
             let alpha = 1;
