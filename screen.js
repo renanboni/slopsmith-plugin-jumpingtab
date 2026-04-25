@@ -1761,14 +1761,14 @@
 
     // ── Context-swap helpers for multi-instance rendering ───
     function _swapRenderTarget(newCanvas, newCtx, newState) {
-        const saved = { canvas, ctx, stateSnap: { ...state } };
-        canvas = newCanvas;
+        const saved = { noteCanvas, ctx, stateSnap: { ...state } };
+        noteCanvas = newCanvas;
         ctx = newCtx;
         Object.assign(state, newState);
         return saved;
     }
     function _restoreRenderTarget(saved) {
-        canvas = saved.canvas;
+        noteCanvas = saved.noteCanvas;
         ctx = saved.ctx;
         Object.assign(state, saved.stateSnap);
     }
@@ -1807,7 +1807,7 @@
             const now = audioEl ? audioEl.currentTime : 0;
             sizeLocal();
             const saved = _swapRenderTarget(localCanvas, localCtx, localState);
-            drawFrame(now);
+            drawNoteFrame(now);
             _restoreRenderTarget(saved);
             localRaf = requestAnimationFrame(localTick);
         }
