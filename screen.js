@@ -1829,7 +1829,10 @@
                 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const qs = (arrangementIdx != null && arrangementIdx >= 0)
                     ? `?arrangement=${arrangementIdx}` : '';
-                const url = `${proto}//${location.host}/ws/highway/${encodeURIComponent(filename)}${qs}`;
+                // filename may already be encoded (from data-play attribute); decode first
+                // to avoid double-encoding slashes in the path, matching highway.js:1670.
+                const decoded = decodeURIComponent(filename);
+                const url = `${proto}//${location.host}/ws/highway/${decoded}${qs}`;
                 const ws = new WebSocket(url);
                 localState.ws = ws;
 
