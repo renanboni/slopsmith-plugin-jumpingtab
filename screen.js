@@ -247,6 +247,11 @@
     function _newState() {
         return {
             tuning: null,
+            // Active string count from bundle.stringCount (slopsmith#93).
+            // null = not yet known; drawFrame's resolution falls back
+            // to 6 when null, or 4 when state.tuning hints at bass via
+            // its (now-truncated under sloppak) length.
+            stringCount: null,
             notes: [],
             arcs: [],
             techArcs: [],
@@ -350,6 +355,7 @@
         state.sections = [];
         state.songInfo = {};
         state.tuning = null;
+        state.stringCount = null;
         state.ready = false;
     }
 
@@ -935,7 +941,21 @@
         const W = canvas.clientWidth;
         const H = canvas.clientHeight;
         if (W === 0 || H === 0) return;
-        const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
+        // Resolve active string count. Prefer state.stringCount
+        // (populated from bundle.stringCount, slopsmith#93) which
+        // is the reliable signal computed server-side. Fall back to
+        // tuning length (works for older sloppaks where tuning
+        // arrays have already been truncated by lib/song.py); fall
+        // back to 6 (the canonical guitar count).
+        //
+        // The previous heuristic `state.tuning.length === 4 ? 4 : 6`
+        // was broken for RS-XML-sourced bass — RS XML always emits
+        // length 6 regardless of instrument, so bass got rendered as
+        // 6 strings with the upper 2 empty. The new server-side
+        // signal handles all sources uniformly.
+        const nStrings = (typeof state.stringCount === 'number' && state.stringCount > 0)
+            ? state.stringCount
+            : (state.tuning && state.tuning.length > 0 ? state.tuning.length : 6);
         const colors = colorsFor(nStrings);
 
         drawBackground(ctx, state, W, H, nStrings, colors, now);
@@ -1229,6 +1249,15 @@
                 // return 4. null is harmless — nStrings falls back
                 // to the guitar (6) default.
                 state.tuning = Array.isArray(info.tuning) ? info.tuning : null;
+                // Active string count from slopsmith core
+                // (slopsmith#93). Always overwrite — nullish during
+                // a between-songs window forces drawFrame to fall
+                // back to tuning length / 6 instead of carrying a
+                // previous song's stale value.
+                state.stringCount = (typeof bundle.stringCount === 'number' &&
+                                     bundle.stringCount > 0)
+                    ? bundle.stringCount
+                    : null;
 
                 // Beats / sections track bundle references (same
                 // identity-swap semantics as notes / chords). Always
