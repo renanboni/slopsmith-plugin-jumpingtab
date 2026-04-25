@@ -43,13 +43,13 @@ check(g1, 'guitar rows evenly spaced',
 // ── timeX ────────────────────────────────────────────────
 const g2 = group('timeX');
 const W = 1000;
-const hit = W * 0.15; // HIT_LINE_FRAC
+const hit = W * core.HIT_LINE_FRAC;
 check(g2, 'now note sits on hit line',
   Math.abs(core.timeX(10, 10, W) - hit) < 0.5);
 check(g2, 'future note (1s ahead) is right of hit line',
   core.timeX(11, 10, W) > hit);
 check(g2, 'AHEAD-second note at right edge',
-  Math.abs(core.timeX(10 + 2.8, 10, W) - W) < 1);
+  Math.abs(core.timeX(10 + core.AHEAD, 10, W) - W) < 1);
 check(g2, 'past note left of hit line',
   core.timeX(9.8, 10, W) < hit);
 

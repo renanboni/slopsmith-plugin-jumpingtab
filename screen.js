@@ -2,24 +2,31 @@
 // tablature view. A glowing ball hops along a parabolic trajectory
 // from note to note on a 6-string (or 4-string bass) canvas tab.
 //
-// Wave B migration (slopsmith#36 path 1): the plugin used to open its
-// own /ws/highway/{filename} WebSocket, parse song_info/notes/chords/
-// beats/sections into module-scope state, then build trajectories on
-// the client. It now consumes that same data from the setRenderer
-// `bundle` passed to draw() — zero extra WebSockets, no custom route,
-// difficulty-filter aware arrays. Trajectories still build
-// client-side (this was always the case) but now from bundle input
-// rather than from our own WS parse.
+// Wave C (slopsmith#36): per-instance refactor. Earlier Wave B
+// landed setRenderer support with an explicit single-instance
+// module-state assumption (one canvas wrapper, one chart cache,
+// one trajectory list). Wave C lifts that: rendering canvas, chart
+// caches, trajectory + technique arc caches, and listener refs are
+// now all per-instance (closured inside createFactory). Main-player
+// usage keeps its single-instance fast path; under splitscreen each
+// panel gets its own state, so N panels can render different
+// arrangements of the same song without cache cross-talk.
 //
-// Jumping Tab is arrangement-agnostic — it works on any song's
-// arrangement — so no matchesArrangement is declared. Auto mode
-// won't pick it automatically; users select it manually via the viz
-// picker.
+// Pure helpers (geometry / time→x mappings / trajectory builder /
+// bezier interpolation / range search) stay at module scope —
+// they're stateless and the test harness exercises them directly.
 //
-// Single-instance assumption: overlay canvas wrapper + chart caches
-// live at module scope. The main-player picker uses one instance at
-// a time. Splitscreen per-panel setRenderer adoption (Wave C) will
-// re-factor into createFactory closures.
+// Draw functions take (ctx, state) as their first arguments so the
+// same set of routines can render either a per-instance factory
+// state OR the standalone demo state. The demo harness
+// (window.__jumpingtab_state / window.__jumpingtab_demo) preserves
+// its module-level mini-state so existing test.html bindings keep
+// working without changes.
+//
+// Trajectory cache multiplies by N under splitscreen: each panel
+// rebuilds its own trajectories on first draw whenever bundle.notes
+// / bundle.chords reference-change. Acceptable cost — trajectories
+// are cheap and the cache hit rate is still ~100% within a song.
 
 (function () {
     'use strict';
@@ -38,15 +45,30 @@
     const NOTE_BASE_R = 14;
     const NOTE_MAX_R = 18;
     const HEADER_H = 36;
+    const MIN_NOTE_R = 6;
 
     const GUITAR_COLORS = ['#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
     const BASS_COLORS   = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff'];
 
-    // ── Pure helpers (unchanged — test harness exercises these) ─────
+    // ── Section color palette (cycled) ──────────────────────
+    const SECTION_COLORS = [
+        'rgba(110, 231, 255, 0.10)',  // cyan
+        'rgba(183, 134, 255, 0.10)',  // purple
+        'rgba(107, 255, 149, 0.10)',  // green
+        'rgba(255, 194, 107, 0.10)',  // orange
+        'rgba(255, 107, 139, 0.10)',  // pink
+    ];
+
+    // ── Pure helpers (stateless — test harness exercises these) ──
+
     function stringY(s, height, nStrings) {
         const usable = height - TOP_PAD - BOTTOM_PAD;
         const gap = usable / (nStrings - 1);
         return TOP_PAD + s * gap;
+    }
+
+    function yFor(s, H, nStrings) {
+        return stringY(nStrings - 1 - s, H, nStrings);
     }
 
     function colorsFor(nStrings) {
@@ -110,51 +132,6 @@
         return arcs;
     }
 
-    function bendText(bn) {
-        if (!bn || bn <= 0) return '';
-        if (bn === 0.5) return '½';
-        if (bn === 1) return 'full';
-        if (bn === 1.5) return '1½';
-        if (bn === 2) return '2';
-        if (bn === 2.5) return '2½';
-        if (bn >= 3) return String(Math.round(bn));
-        return bn.toFixed(1);
-    }
-
-    function bezierPoint(x0, y0, cx, cy, x1, y1, u) {
-        const v = 1 - u;
-        return {
-            x: v * v * x0 + 2 * v * u * cx + u * u * x1,
-            y: v * v * y0 + 2 * v * u * cy + u * u * y1,
-        };
-    }
-
-    // ── Exports for test harness ──────────────────────────────
-    window.__jumpingtab_core = {
-        stringY, colorsFor, timeX, binaryVisibleRange, buildTrajectories, bezierPoint,
-        AHEAD, BEHIND, HIT_LINE_FRAC,
-    };
-
-    // ── Module-level cached chart state (built from bundle) ──
-    const state = {
-        tuning: null,
-        notes: [],
-        arcs: [],
-        techArcs: [],
-        techPaired: new Set(),
-        beats: [],
-        sections: [],
-        songInfo: {},
-        ready: false,
-    };
-    // Reference-identity sentinels for cache invalidation. Core
-    // creates a new array whenever the filtered chart rebuilds (new
-    // song, arrangement change, or master-difficulty change flips
-    // _filteredNotes), so reference-compare is a cheap, reliable
-    // signal that we must rebuild trajectories + gaps.
-    let _lastNotesRef = null;
-    let _lastChordsRef = null;
-
     function buildTechniqueArcs(notes) {
         const arcs = [];
         const paired = new Set();
@@ -187,12 +164,107 @@
         return { arcs, paired };
     }
 
+    function bendText(bn) {
+        if (!bn || bn <= 0) return '';
+        if (bn === 0.5) return '½';
+        if (bn === 1) return 'full';
+        if (bn === 1.5) return '1½';
+        if (bn === 2) return '2';
+        if (bn === 2.5) return '2½';
+        if (bn >= 3) return String(Math.round(bn));
+        return bn.toFixed(1);
+    }
+
+    function bezierPoint(x0, y0, cx, cy, x1, y1, u) {
+        const v = 1 - u;
+        return {
+            x: v * v * x0 + 2 * v * u * cx + u * u * x1,
+            y: v * v * y0 + 2 * v * u * cy + u * u * y1,
+        };
+    }
+
+    function noteRadius(x, hitX, W) {
+        const dxRight = Math.abs(x - hitX);
+        const span = Math.max(hitX, W - hitX);
+        const t = 1 - Math.min(1, dxRight / (span * 0.6));
+        return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
+    }
+
+    function secondsToPx(seconds, W) {
+        const hitX = W * HIT_LINE_FRAC;
+        return seconds * (W - hitX) / AHEAD;
+    }
+
+    function clampByNeighbors(baseR, n, W) {
+        const gap = Math.min(n._gapL || Infinity, n._gapR || Infinity);
+        if (!isFinite(gap)) return baseR;
+        const gapPx = secondsToPx(gap, W);
+        const maxR = Math.max(MIN_NOTE_R, gapPx / 2 - 3);
+        return Math.min(baseR, maxR);
+    }
+
+    function arcControlPoint(x0, y0, x1, y1) {
+        const midX = (x0 + x1) / 2;
+        const dy = Math.abs(y1 - y0);
+        const rise = Math.min(70, 20 + dy * 1.2);
+        const midY = Math.min(y0, y1) - rise;
+        return { cx: midX, cy: midY };
+    }
+
+    function findActiveArc(arcs, now) {
+        let best = null;
+        for (const a of arcs) {
+            if (a.t0 <= now && now <= a.t1) return a;
+            if (a.t1 < now && (!best || a.t1 > best.t1)) best = a;
+        }
+        return best;
+    }
+
+    function nearestNoteAtHit(notes, now, hitX, W) {
+        const { start, end } = binaryVisibleRange(notes, now);
+        let best = null, bestDx = Infinity;
+        for (let i = start; i < end; i++) {
+            const n = notes[i];
+            const x = timeX(n.t, now, W);
+            const dx = Math.abs(x - hitX);
+            if (dx < bestDx) { bestDx = dx; best = { note: n, dx, x }; }
+        }
+        return best;
+    }
+
+    function currentSection(sections, now) {
+        if (!sections || !sections.length) return null;
+        let cur = null;
+        for (const sec of sections) {
+            if (sec.time <= now) cur = sec;
+            else break;
+        }
+        return cur;
+    }
+
+    // ── Pure-state factory (used by both factory instances and demo) ──
+
+    function _newState() {
+        return {
+            tuning: null,
+            notes: [],
+            arcs: [],
+            techArcs: [],
+            techPaired: new Set(),
+            beats: [],
+            sections: [],
+            songInfo: {},
+            ready: false,
+        };
+    }
+
     // Flatten bundle.notes + bundle.chords into the single sorted
     // array the rest of this module expects, then precompute
     // per-note same-string neighbor gaps (needed by drawNotes'
-    // radius clamp). Mirrors the finalize() step from the old
-    // WS path on connect(), minus the WS-only bookkeeping.
-    function _rebuildChart(notes, chords) {
+    // radius clamp). Mutates `state` in place — the per-instance
+    // state object passed by the factory or the demo harness's
+    // module-level demo state.
+    function _rebuildChart(state, notes, chords) {
         const flat = [];
         if (Array.isArray(notes)) {
             // Clone rather than pushing the upstream note object
@@ -269,7 +341,7 @@
         state.ready = flat.length > 0;
     }
 
-    function _clearChart() {
+    function _clearChart(state) {
         state.notes = [];
         state.arcs = [];
         state.techArcs = [];
@@ -279,129 +351,14 @@
         state.songInfo = {};
         state.tuning = null;
         state.ready = false;
-        _lastNotesRef = null;
-        _lastChordsRef = null;
     }
 
-    // ── Canvas lifecycle ─────────────────────────────────────
-    let canvas = null;
-    let wrap = null;
-    let ctx = null;
-    let highwayCanvas = null;
-    let prevHighwayDisplay = '';
+    // ═══════════════════════════════════════════════════════════════════════
+    // Renderers — accept (ctx, state) so the same routines drive both
+    // per-instance factory state and the standalone demo harness.
+    // ═══════════════════════════════════════════════════════════════════════
 
-    function yFor(s, H, nStrings) {
-        return stringY(nStrings - 1 - s, H, nStrings);
-    }
-
-    function sizeCanvasToBox() {
-        if (!canvas || !ctx) return;
-        const rect = canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        const pxW = Math.max(1, Math.floor(rect.width * dpr));
-        const pxH = Math.max(1, Math.floor(rect.height * dpr));
-        if (canvas.width !== pxW || canvas.height !== pxH) {
-            canvas.width = pxW;
-            canvas.height = pxH;
-        }
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    }
-
-    function mountCanvas(providedHighwayCanvas) {
-        // We anchor our wrap via
-        // providedHighwayCanvas.insertAdjacentElement('afterend', ...),
-        // so the only DOM dependency is a canvas with a connected
-        // parent. The prior `#player` lookup was never actually used
-        // below and made init() fail in environments where the
-        // enclosing container has a different id (splitscreen panels,
-        // tests, hosts that rename the shell).
-        if (!providedHighwayCanvas || !providedHighwayCanvas.parentNode) return false;
-
-        wrap = document.createElement('div');
-        wrap.id = 'jumpingtab-wrap';
-        wrap.style.cssText = [
-            'flex:1',
-            'min-height:0',
-            'display:flex',
-            'align-items:center',
-            'justify-content:center',
-            'padding:0 24px',
-        ].join(';');
-
-        canvas = document.createElement('canvas');
-        canvas.id = 'jumpingtab-canvas';
-        canvas.style.cssText = [
-            'width:100%',
-            'max-width:1400px',
-            'height:min(42vh, 360px)',
-            'display:block',
-            'background:#0f1420',
-            'border-radius:10px',
-            'box-shadow:0 8px 24px rgba(0,0,0,0.4)',
-        ].join(';');
-
-        wrap.appendChild(canvas);
-        providedHighwayCanvas.insertAdjacentElement('afterend', wrap);
-        ctx = canvas.getContext('2d');
-        if (!ctx) {
-            // getContext('2d') can return null when the browser has
-            // locked this canvas element to a different context type,
-            // or when 2D support is disabled for the origin. Without
-            // this guard init() would hide the highway canvas and
-            // flip _isReady=true, then drawFrame would no-op against
-            // the null ctx every rAF — leaving the player blank with
-            // no recovery until the user picked a different viz. Tear
-            // the overlay down, leave the highway visible as a
-            // fallback, and signal failure up to init().
-            console.warn('[jumpingtab] mountCanvas: getContext("2d") returned null; aborting');
-            wrap.remove();
-            wrap = null;
-            canvas = null;
-            return false;
-        }
-
-        highwayCanvas = providedHighwayCanvas;
-        prevHighwayDisplay = providedHighwayCanvas.style.display;
-        providedHighwayCanvas.style.display = 'none';
-        sizeCanvasToBox();
-        return true;
-    }
-
-    function unmountCanvas() {
-        if (wrap) {
-            wrap.remove();
-            wrap = null;
-            canvas = null;
-            ctx = null;
-        }
-        if (highwayCanvas) {
-            highwayCanvas.style.display = prevHighwayDisplay;
-            highwayCanvas = null;
-            prevHighwayDisplay = '';
-        }
-    }
-
-    // ── Section color palette (cycled) ──────────────────────
-    const SECTION_COLORS = [
-        'rgba(110, 231, 255, 0.10)',  // cyan
-        'rgba(183, 134, 255, 0.10)',  // purple
-        'rgba(107, 255, 149, 0.10)',  // green
-        'rgba(255, 194, 107, 0.10)',  // orange
-        'rgba(255, 107, 139, 0.10)',  // pink
-    ];
-
-    function currentSection(sections, now) {
-        if (!sections || !sections.length) return null;
-        let cur = null;
-        for (const sec of sections) {
-            if (sec.time <= now) cur = sec;
-            else break;
-        }
-        return cur;
-    }
-
-    // ── Renderer ─────────────────────────────────────────────
-    function drawBackground(W, H, nStrings, colors, now) {
+    function drawBackground(ctx, state, W, H, nStrings, colors, now) {
         ctx.fillStyle = '#070b18';
         ctx.fillRect(0, 0, W, H);
 
@@ -497,7 +454,7 @@
         ctx.restore();
     }
 
-    function drawEdgeFade(W, H) {
+    function drawEdgeFade(ctx, W, H) {
         const topBand = TOP_PAD;
         const botBand = H - BOTTOM_PAD;
         const laneH = botBand - topBand;
@@ -516,7 +473,7 @@
         ctx.fillRect(W - fadeW, topBand, fadeW, laneH);
     }
 
-    function drawHeader(W, H, now) {
+    function drawHeader(ctx, state, W, H, now) {
         const info = state.songInfo || {};
         const sec = currentSection(state.sections, now);
 
@@ -566,7 +523,7 @@
         }
     }
 
-    function drawProgress(W, H, now) {
+    function drawProgress(ctx, state, W, H, now) {
         const duration = (state.songInfo && state.songInfo.duration) || 0;
         if (duration <= 0) return;
 
@@ -612,28 +569,7 @@
         ctx.fillText(fmt(duration), barX + barW, barY - 8);
     }
 
-    function noteRadius(x, hitX, W) {
-        const dxRight = Math.abs(x - hitX);
-        const span = Math.max(hitX, W - hitX);
-        const t = 1 - Math.min(1, dxRight / (span * 0.6));
-        return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
-    }
-
-    function secondsToPx(seconds, W) {
-        const hitX = W * HIT_LINE_FRAC;
-        return seconds * (W - hitX) / AHEAD;
-    }
-
-    const MIN_NOTE_R = 6;
-    function clampByNeighbors(baseR, n, W) {
-        const gap = Math.min(n._gapL || Infinity, n._gapR || Infinity);
-        if (!isFinite(gap)) return baseR;
-        const gapPx = secondsToPx(gap, W);
-        const maxR = Math.max(MIN_NOTE_R, gapPx / 2 - 3);
-        return Math.min(baseR, maxR);
-    }
-
-    function drawSustains(W, H, nStrings, colors, now) {
+    function drawSustains(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const tailHeight = 8;
@@ -662,15 +598,7 @@
         }
     }
 
-    function arcControlPoint(x0, y0, x1, y1) {
-        const midX = (x0 + x1) / 2;
-        const dy = Math.abs(y1 - y0);
-        const rise = Math.min(70, 20 + dy * 1.2);
-        const midY = Math.min(y0, y1) - rise;
-        return { cx: midX, cy: midY };
-    }
-
-    function drawTechniquePairs(W, H, nStrings, colors, now) {
+    function drawTechniquePairs(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.techArcs || !state.techArcs.length) return;
         const lo = now - BEHIND;
         const hi = now + AHEAD;
@@ -736,7 +664,7 @@
         }
     }
 
-    function drawTechniqueArcs(W, H, nStrings, colors, now) {
+    function drawTechniqueArcs(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.techArcs || !state.techArcs.length) return;
         const lo = now - BEHIND;
         const hi = now + AHEAD;
@@ -777,28 +705,7 @@
         ctx.restore();
     }
 
-    function findActiveArc(arcs, now) {
-        let best = null;
-        for (const a of arcs) {
-            if (a.t0 <= now && now <= a.t1) return a;
-            if (a.t1 < now && (!best || a.t1 > best.t1)) best = a;
-        }
-        return best;
-    }
-
-    function nearestNoteAtHit(notes, now, hitX, W) {
-        const { start, end } = binaryVisibleRange(notes, now);
-        let best = null, bestDx = Infinity;
-        for (let i = start; i < end; i++) {
-            const n = notes[i];
-            const x = timeX(n.t, now, W);
-            const dx = Math.abs(x - hitX);
-            if (dx < bestDx) { bestDx = dx; best = { note: n, dx, x }; }
-        }
-        return best;
-    }
-
-    function drawBall(W, H, nStrings, colors, now) {
+    function drawBall(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.arcs.length) return;
         const arc = findActiveArc(state.arcs, now);
         if (!arc) return;
@@ -841,7 +748,7 @@
         ctx.restore();
     }
 
-    function drawImpacts(W, H, nStrings, colors, now) {
+    function drawImpacts(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const hitX = W * HIT_LINE_FRAC;
@@ -901,7 +808,7 @@
         }
     }
 
-    function drawBends(W, H, nStrings, colors, now) {
+    function drawBends(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
 
@@ -962,7 +869,7 @@
         }
     }
 
-    function drawNotes(W, H, nStrings, colors, now) {
+    function drawNotes(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const hitX = W * HIT_LINE_FRAC;
@@ -1023,7 +930,7 @@
         }
     }
 
-    function drawFrame(now) {
+    function drawFrame(ctx, state, canvas, now) {
         if (!ctx || !canvas) return;
         const W = canvas.clientWidth;
         const H = canvas.clientHeight;
@@ -1031,49 +938,88 @@
         const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
         const colors = colorsFor(nStrings);
 
-        drawBackground(W, H, nStrings, colors, now);
-        drawSustains(W, H, nStrings, colors, now);
+        drawBackground(ctx, state, W, H, nStrings, colors, now);
+        drawSustains(ctx, state, W, H, nStrings, colors, now);
         // drawArcs (dashed trajectory curves) intentionally omitted —
         // the ball still hops along state.arcs; we just don't
         // visualize the path.
-        drawTechniquePairs(W, H, nStrings, colors, now);
-        drawTechniqueArcs(W, H, nStrings, colors, now);
-        drawNotes(W, H, nStrings, colors, now);
-        drawBends(W, H, nStrings, colors, now);
-        drawImpacts(W, H, nStrings, colors, now);
-        drawBall(W, H, nStrings, colors, now);
-        drawEdgeFade(W, H);
-        drawHeader(W, H, now);
-        drawProgress(W, H, now);
+        drawTechniquePairs(ctx, state, W, H, nStrings, colors, now);
+        drawTechniqueArcs(ctx, state, W, H, nStrings, colors, now);
+        drawNotes(ctx, state, W, H, nStrings, colors, now);
+        drawBends(ctx, state, W, H, nStrings, colors, now);
+        drawImpacts(ctx, state, W, H, nStrings, colors, now);
+        drawBall(ctx, state, W, H, nStrings, colors, now);
+        drawEdgeFade(ctx, W, H);
+        drawHeader(ctx, state, W, H, now);
+        drawProgress(ctx, state, W, H, now);
     }
 
-    // Debug / demo-harness hook preserved from the pre-migration
-    // version — the standalone demo/ HTML binds a canvas, sets
-    // synthetic state, and invokes drawFrame directly. Used to
-    // generate README screenshots without running slopsmith.
-    window.__jumpingtab_state = state;
+    // ── Pure-helper exports for the test harness ────────────────────
+    //
+    // Surface is intentionally broad. These are all stateless and the
+    // test harness can exercise any subset; keeping the export aligned
+    // with the full pure-helper layer (rather than a hand-picked few)
+    // means a new test that wants e.g. clampByNeighbors or
+    // findActiveArc doesn't require a plugin-side patch.
+    window.__jumpingtab_core = {
+        stringY, yFor, colorsFor, timeX,
+        binaryVisibleRange, buildTrajectories, buildTechniqueArcs,
+        bezierPoint, noteRadius, secondsToPx, clampByNeighbors,
+        arcControlPoint, findActiveArc, nearestNoteAtHit,
+        currentSection, bendText,
+        AHEAD, BEHIND, HIT_LINE_FRAC, FADE_SECONDS, IMPACT_DURATION,
+        SQUASH_WINDOW_MS, NOTE_BASE_R, NOTE_MAX_R, MIN_NOTE_R,
+    };
+
+    // ── Demo / test-harness scaffolding ─────────────────────────────
+    //
+    // The standalone demo/ HTML binds a canvas, sets synthetic state,
+    // and calls drawFrame directly to generate README screenshots
+    // without running slopsmith. Wave C keeps this exact API working
+    // by giving the demo its own module-scope state + canvas / ctx
+    // refs — separate from any factory instance — so demo invocations
+    // never clobber per-instance state.
+
+    const _demoState = _newState();
+    let _demoCanvas = null;
+    let _demoCtx = null;
+
+    window.__jumpingtab_state = _demoState;
     window.__jumpingtab_demo = {
         setCanvas(cnv) {
-            canvas = cnv;
-            ctx = cnv.getContext('2d');
+            // getContext('2d') can return null when the browser has
+            // locked this canvas to a different context type or 2D
+            // is disabled for the origin. Mirror mountCanvas's
+            // production guard: warn + bail rather than throwing on
+            // the .setTransform below, which would leave the demo
+            // harness in a half-initialised state (canvas captured
+            // but no usable ctx) and break test.html silently.
+            const ctx2d = cnv.getContext('2d');
+            if (!ctx2d) {
+                console.warn('[jumpingtab] demo.setCanvas: getContext("2d") returned null; aborting');
+                return false;
+            }
+            _demoCanvas = cnv;
+            _demoCtx = ctx2d;
             const dpr = window.devicePixelRatio || 1;
             const rect = cnv.getBoundingClientRect();
             cnv.width = Math.max(1, Math.floor(rect.width * dpr));
             cnv.height = Math.max(1, Math.floor(rect.height * dpr));
-            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            _demoCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            return true;
         },
-        setState(patch) { Object.assign(state, patch); },
+        setState(patch) { Object.assign(_demoState, patch); },
         finalizeState() {
-            state.notes.sort((a, b) => a.t - b.t);
+            _demoState.notes.sort((a, b) => a.t - b.t);
             const lastIdxByString = new Map();
             const EPS_T = 1e-4;
-            for (let i = 0; i < state.notes.length; i++) {
-                const n = state.notes[i];
+            for (let i = 0; i < _demoState.notes.length; i++) {
+                const n = _demoState.notes[i];
                 n._gapL = Infinity;
                 n._gapR = Infinity;
                 const prevIdx = lastIdxByString.get(n.s);
                 if (prevIdx != null) {
-                    const prev = state.notes[prevIdx];
+                    const prev = _demoState.notes[prevIdx];
                     const gap = n.t - prev.t;
                     if (gap > EPS_T) {
                         n._gapL = gap;
@@ -1082,25 +1028,161 @@
                 }
                 lastIdxByString.set(n.s, i);
             }
-            state.arcs = buildTrajectories(state.notes);
-            const tech = buildTechniqueArcs(state.notes);
-            state.techArcs = tech.arcs;
-            state.techPaired = tech.paired;
-            state.ready = true;
+            _demoState.arcs = buildTrajectories(_demoState.notes);
+            const tech = buildTechniqueArcs(_demoState.notes);
+            _demoState.techArcs = tech.arcs;
+            _demoState.techPaired = tech.paired;
+            _demoState.ready = true;
         },
-        drawFrame,
+        drawFrame(now) {
+            drawFrame(_demoCtx, _demoState, _demoCanvas, now);
+        },
     };
 
-    // ── Factory — slopsmith#36 setRenderer contract ────────────
+    // ── Per-instance counter for DOM tagging ────────────────────────
+    let _nextInstanceId = 0;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Factory — slopsmith#36 setRenderer contract (multi-instance)
+    // ═══════════════════════════════════════════════════════════════════════
+
     function createFactory() {
+        const _instanceId = ++_nextInstanceId;
+
+        // Lifecycle
         let _isReady = false;
+
+        // Per-instance chart cache. Each panel under splitscreen
+        // builds its own — even when N panels render the same song,
+        // a panel's filtered notes (master-difficulty per panel) and
+        // arrangement choice can differ, and trajectory arcs must
+        // mirror what's actually visible.
+        const state = _newState();
+
+        // Reference-identity sentinels for cache invalidation. Core
+        // creates a new array whenever the filtered chart rebuilds
+        // (new song, arrangement change, master-difficulty flip
+        // changing _filteredNotes), so reference-compare is a cheap,
+        // reliable signal that we must rebuild trajectories + gaps.
+        let _lastNotesRef = null;
+        let _lastChordsRef = null;
+
+        // Rendering / DOM state — one set per panel.
+        let canvas = null;
+        let wrap = null;
+        let ctx = null;
+        let highwayCanvas = null;
+        let prevHighwayDisplay = '';
+
+        // ── Listener ref (per-instance so detach matches attach) ──
         const _onWinResize = () => sizeCanvasToBox();
+
+        function sizeCanvasToBox() {
+            if (!canvas || !ctx) return;
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            const pxW = Math.max(1, Math.floor(rect.width * dpr));
+            const pxH = Math.max(1, Math.floor(rect.height * dpr));
+            if (canvas.width !== pxW || canvas.height !== pxH) {
+                canvas.width = pxW;
+                canvas.height = pxH;
+            }
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        function mountCanvas(providedHighwayCanvas) {
+            // We anchor our wrap via
+            // providedHighwayCanvas.insertAdjacentElement('afterend', ...),
+            // so the only DOM dependency is a canvas with a connected
+            // parent. The prior `#player` lookup was never actually used
+            // below and made init() fail in environments where the
+            // enclosing container has a different id (splitscreen panels,
+            // tests, hosts that rename the shell).
+            if (!providedHighwayCanvas || !providedHighwayCanvas.parentNode) return false;
+
+            wrap = document.createElement('div');
+            // Per-instance id so N splitscreen panels don't collide
+            // on getElementById lookups. Class kept alongside for any
+            // plugin-wide CSS that might want to target every wrap.
+            wrap.id = 'jumpingtab-wrap-' + _instanceId;
+            wrap.className = 'jumpingtab-wrap';
+            wrap.dataset.jumpingtabInstance = String(_instanceId);
+            wrap.style.cssText = [
+                'flex:1',
+                'min-height:0',
+                'display:flex',
+                'align-items:center',
+                'justify-content:center',
+                'padding:0 24px',
+            ].join(';');
+
+            canvas = document.createElement('canvas');
+            canvas.id = 'jumpingtab-canvas-' + _instanceId;
+            canvas.className = 'jumpingtab-canvas';
+            canvas.dataset.jumpingtabInstance = String(_instanceId);
+            canvas.style.cssText = [
+                'width:100%',
+                'max-width:1400px',
+                'height:min(42vh, 360px)',
+                'display:block',
+                'background:#0f1420',
+                'border-radius:10px',
+                'box-shadow:0 8px 24px rgba(0,0,0,0.4)',
+            ].join(';');
+
+            wrap.appendChild(canvas);
+            providedHighwayCanvas.insertAdjacentElement('afterend', wrap);
+            ctx = canvas.getContext('2d');
+            if (!ctx) {
+                // getContext('2d') can return null when the browser has
+                // locked this canvas element to a different context type,
+                // or when 2D support is disabled for the origin. Without
+                // this guard init() would hide the highway canvas and
+                // flip _isReady=true, then drawFrame would no-op against
+                // the null ctx every rAF — leaving the player blank with
+                // no recovery until the user picked a different viz. Tear
+                // the overlay down, leave the highway visible as a
+                // fallback, and signal failure up to init().
+                console.warn('[jumpingtab] mountCanvas: getContext("2d") returned null; aborting');
+                wrap.remove();
+                wrap = null;
+                canvas = null;
+                return false;
+            }
+
+            highwayCanvas = providedHighwayCanvas;
+            prevHighwayDisplay = providedHighwayCanvas.style.display;
+            providedHighwayCanvas.style.display = 'none';
+            sizeCanvasToBox();
+            return true;
+        }
+
+        function unmountCanvas() {
+            if (wrap) {
+                wrap.remove();
+                wrap = null;
+                canvas = null;
+                ctx = null;
+            }
+            if (highwayCanvas) {
+                highwayCanvas.style.display = prevHighwayDisplay;
+                highwayCanvas = null;
+                prevHighwayDisplay = '';
+            }
+        }
+
+        function _teardown() {
+            unmountCanvas();
+            _clearChart(state);
+            _lastNotesRef = null;
+            _lastChordsRef = null;
+        }
 
         return {
             init(providedCanvas /* , bundle */) {
                 // Defensive teardown mirrors destroy() exactly —
-                // including restoreCanvas=true. If we skipped the
-                // window.resize listener removal, a double init()
+                // including the highway canvas restore. If we skipped
+                // the window.resize listener removal, a double init()
                 // would leak a second listener; every resize would
                 // fire sizeCanvasToBox twice. And if we skipped the
                 // highway canvas restore, a later init() against a
@@ -1111,10 +1193,10 @@
                     window.removeEventListener('resize', _onWinResize);
                     _teardown();
                     _isReady = false;
-                    // _teardown already called _clearChart() — don't
-                    // fire a second redundant reset on this branch.
                 } else {
-                    _clearChart();
+                    _clearChart(state);
+                    _lastNotesRef = null;
+                    _lastChordsRef = null;
                 }
                 if (!mountCanvas(providedCanvas)) {
                     console.warn('[jumpingtab] init: failed to mount overlay canvas');
@@ -1169,10 +1251,10 @@
                 if (bundle.notes !== _lastNotesRef || bundle.chords !== _lastChordsRef) {
                     _lastNotesRef = bundle.notes;
                     _lastChordsRef = bundle.chords;
-                    _rebuildChart(bundle.notes, bundle.chords);
+                    _rebuildChart(state, bundle.notes, bundle.chords);
                 }
 
-                drawFrame(bundle.currentTime || 0);
+                drawFrame(ctx, state, canvas, bundle.currentTime || 0);
             },
             resize(/* w, h */) {
                 // Size from the canvas's own bounding rect — the w/h
@@ -1188,11 +1270,6 @@
                 _teardown();
             },
         };
-
-        function _teardown() {
-            unmountCanvas();
-            _clearChart();
-        }
     }
 
     window.slopsmithViz_jumpingtab = createFactory;
