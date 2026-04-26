@@ -43,13 +43,13 @@ check(g1, 'guitar rows evenly spaced',
 // ── timeX ────────────────────────────────────────────────
 const g2 = group('timeX');
 const W = 1000;
-const hit = W * 0.15; // HIT_LINE_FRAC
+const hit = W * core.HIT_LINE_FRAC;
 check(g2, 'now note sits on hit line',
   Math.abs(core.timeX(10, 10, W) - hit) < 0.5);
 check(g2, 'future note (1s ahead) is right of hit line',
   core.timeX(11, 10, W) > hit);
 check(g2, 'AHEAD-second note at right edge',
-  Math.abs(core.timeX(10 + 2.8, 10, W) - W) < 1);
+  Math.abs(core.timeX(10 + core.AHEAD, 10, W) - W) < 1);
 check(g2, 'past note left of hit line',
   core.timeX(9.8, 10, W) < hit);
 
@@ -129,6 +129,25 @@ arcs = core.buildTrajectories([
 ]);
 check(g4, 'chord with 1μs drift still groups (2 arcs, not 3)',
   arcs.length === 2, 'got ' + arcs.length);
+
+// ── colorsFor ────────────────────────────────────────────
+const g_cf = group('colorsFor');
+const cFour  = core.colorsFor(4);
+const cFive  = core.colorsFor(5);
+const cSix   = core.colorsFor(6);
+const cSeven = core.colorsFor(7);
+const cEight = core.colorsFor(8);
+// BASS_COLORS / GUITAR_COLORS are not exported — assert by length
+// since BASS_COLORS has 5 entries and GUITAR_COLORS has 8.
+check(g_cf, 'colorsFor(4) → bass palette (5 entries)', cFour.length === 5);
+check(g_cf, 'colorsFor(5) → bass palette (5 entries)', cFive.length === 5);
+check(g_cf, 'colorsFor(6) → guitar palette (8 entries)', cSix.length === 8);
+check(g_cf, 'colorsFor(7) → guitar palette (8 entries)', cSeven.length === 8);
+check(g_cf, 'colorsFor(8) → guitar palette (8 entries)', cEight.length === 8);
+// Boundary: 4 and 5 share the same array reference; 6+ share theirs.
+check(g_cf, 'colorsFor(4) and colorsFor(5) share array ref', cFour === cFive);
+check(g_cf, 'colorsFor(6) and colorsFor(7) share array ref', cSix === cSeven);
+check(g_cf, 'colorsFor(5) and colorsFor(6) differ', cFive !== cSix);
 
 // ── bezierPoint ──────────────────────────────────────────
 const g5 = group('bezierPoint');
