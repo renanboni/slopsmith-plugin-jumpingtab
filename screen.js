@@ -32,29 +32,43 @@
     'use strict';
 
     // ── Constants ─────────────────────────────────────────────
-    const AHEAD = 8.0;
+    // Visual lookahead window: 5.5 seconds matches renanboni's
+    // fork (preferred over byrongamatos's 8.0 — shorter window,
+    // larger note rendering, easier to read at speed).
+    const AHEAD = 5.5;
     const BEHIND = 1.2;
     const HIT_LINE_FRAC = 0.18;
     const FADE_SECONDS = 1.0;
     const SQUASH_WINDOW_MS = 60;
     const IMPACT_DURATION = 0.45;
+    // Renanboni / alleexx's preference: opt out of the impact-ring
+    // animation when notes cross the hit line. The ring code still
+    // runs (drawImpacts is part of the standard draw chain) but
+    // returns early when this flag is true.
+    const DISABLE_RINGS = true;
     const TOP_PAD = 60;
     const BOTTOM_PAD = 36;
     const HIT_ZONE_WIDTH = 56;
     const EDGE_FADE_FRAC = 0.06;
-    const NOTE_BASE_R = 14;
+    // Note radius preferences from renanboni: fatter notes + a
+    // consistent base/max so circles stay readable at speed.
+    const NOTE_BASE_R = 18;
     const NOTE_MAX_R = 18;
     const HEADER_H = 36;
     const MIN_NOTE_R = 6;
 
-    // Per-string colors. GUITAR_COLORS covers 6-string guitar +
-    // extended-range up to 8 strings (slopsmith-plugin-3dhighway#7);
+    // Per-string colors. Order matches renanboni's
+    // Rocksmith-aligned palette — string 0 (high E) is pink, string
+    // 1 (B) is yellow, string 2 (G) is cyan, etc. — instead of
+    // byrongamatos's earlier order. Extended-range positions 6 / 7
+    // (7-string / 8-string guitars from GP imports) are added on
+    // top of renanboni's 6-color palette.
     // BASS_COLORS covers 4-string bass + 5-string bass (its 5th
-    // color reuses the 6th guitar color, `#c56bff`, for warmth).
+    // color reuses GUITAR_COLORS[5] for warmth).
     // Lookups still fall back to FALLBACK_COLOR via the
     // `|| FALLBACK_COLOR` guards in the draw* functions.
     const GUITAR_COLORS = [
-        '#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff',
+        '#ff6b8b', '#ffe66b', '#6bd5ff', '#ffa56b', '#6bff95', '#c56bff',
         '#ff6bd5', '#6bffe6',  // 7th = pink, 8th = aqua
     ];
     const BASS_COLORS = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
@@ -789,6 +803,12 @@
     }
 
     function drawImpacts(ctx, state, W, H, nStrings, colors, now) {
+        // DISABLE_RINGS: renanboni / alleexx's preference — the
+        // expanding-ring animation on hit-line crossings was too
+        // visually busy. Skipping the per-note ring work here also
+        // saves a hot-path scan over visible notes when the feature
+        // is off.
+        if (DISABLE_RINGS) return;
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const hitX = W * HIT_LINE_FRAC;
