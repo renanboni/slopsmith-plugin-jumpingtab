@@ -49,10 +49,10 @@
 
     // Per-string colors. GUITAR_COLORS covers 6-string guitar +
     // extended-range up to 8 strings (slopsmith-plugin-3dhighway#7);
-    // BASS_COLORS covers 4-string bass + 5-string bass (added 7th
-    // string color reused as the 5th bass color for warmth).
-    // Lookups still fall back to '#888' via the '|| ' guards in
-    // draw* functions.
+    // BASS_COLORS covers 4-string bass + 5-string bass (its 5th
+    // color reuses the 6th guitar color, `#c56bff`, for warmth).
+    // Lookups still fall back to FALLBACK_COLOR via the
+    // `|| FALLBACK_COLOR` guards in the draw* functions.
     const GUITAR_COLORS = [
         '#ff6b8b', '#ffa56b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff',
         '#ff6bd5', '#6bffe6',  // 7th = pink, 8th = aqua
@@ -263,9 +263,12 @@
         return {
             tuning: null,
             // Active string count from bundle.stringCount (slopsmith#93).
-            // null = not yet known; drawFrame's resolution falls back
-            // to 6 when null, or 4 when state.tuning hints at bass via
-            // its (now-truncated under sloppak) length.
+            // null = not yet known; drawFrame resolves the active
+            // count by trying state.stringCount first, then any
+            // positive state.tuning.length, finally falling back to
+            // 6 (canonical guitar count). The 5-string-bass /
+            // 7-string-guitar paths flow through tuning.length when
+            // bundle.stringCount is unavailable from older cores.
             stringCount: null,
             notes: [],
             arcs: [],
@@ -449,16 +452,22 @@
         ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
-        // String labels for the small note-letter circles. Bass uses
-        // the standard 4 (E A D G); 5-string bass adds a low B; guitar
-        // uses 6 (low E to high e); 7-string adds a low B; 8-string
-        // adds a low F#. Lookups beyond the palette fall through to
-        // the empty string so the circle still draws (just unlabelled).
-        const labels = (nStrings === 4) ? ['G','D','A','E']
-                     : (nStrings === 5) ? ['G','D','A','E','B']
-                     : (nStrings === 6) ? ['e','B','G','D','A','E']
-                     : (nStrings === 7) ? ['e','B','G','D','A','E','B']
-                     :                    ['e','B','G','D','A','E','B','F#'];
+        // String labels for the small note-letter circles. Lookup
+        // table keyed by stringCount so adding new instruments later
+        // is a single-line change (rather than another nested
+        // ternary branch). Out-of-table values fall through to the
+        // 8-string layout so 9+-string instruments at least get
+        // sensible labels for their first 8 lanes — string indices
+        // beyond that draw the circle without a letter via the
+        // `labels[s] || ''` guard at the call site.
+        const LABEL_SETS = {
+            4: ['G', 'D', 'A', 'E'],
+            5: ['G', 'D', 'A', 'E', 'B'],
+            6: ['e', 'B', 'G', 'D', 'A', 'E'],
+            7: ['e', 'B', 'G', 'D', 'A', 'E', 'B'],
+            8: ['e', 'B', 'G', 'D', 'A', 'E', 'B', 'F#'],
+        };
+        const labels = LABEL_SETS[nStrings] || LABEL_SETS[8];
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
             const stringColor = colors[s] || FALLBACK_COLOR;
