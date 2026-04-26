@@ -1,3 +1,13 @@
+# Forked Version Adjustments
+
+- changed the order of the String names as from my examples I think they were upside down
+
+- added chord boxes to move on top of the note highway as I have trouble identifying the chord shapes only based on the tab like notation
+
+- changed the string colors to match the rocksmith colors for me to not get confused and also limited the highlight effect when the notes hit the hitline as it was a bit much for me
+
+![Chord Boxes tab view](screenshots/jumpingtab_w_chords.png)
+
 # Jumping Tab
 
 A [slopsmith](https://github.com/byrongamatos/slopsmith) plugin that adds a Yousician-style 2D horizontal tab view to the player. Notes flow right-to-left toward a glowing hit line, trajectory arcs connect consecutive monophonic notes, and a glowing ball visibly hops along those arcs.
