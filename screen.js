@@ -276,6 +276,19 @@
     function _newState() {
         return {
             tuning: null,
+            // Chord events (with .t and .id referencing into
+            // chordTemplates) — populated each frame from
+            // bundle.chords. The chord-box renderer
+            // (drawChordBoxes) reads these directly; the existing
+            // note-tab renderer flattens chords into state.notes
+            // via _rebuildChart so it doesn't need them.
+            chords: [],
+            // Chord-template lookup table (slopsmith#92) — index
+            // by chord.id to get { name, fingers, frets }. Read-
+            // only; empty array means "no chord shapes available
+            // for this song" (common for GP imports without
+            // chord-shape annotations).
+            chordTemplates: [],
             // Active string count from bundle.stringCount (slopsmith#93).
             // null = not yet known; drawFrame resolves the active
             // count by trying state.stringCount first, then any
@@ -380,6 +393,8 @@
 
     function _clearChart(state) {
         state.notes = [];
+        state.chords = [];
+        state.chordTemplates = [];
         state.arcs = [];
         state.techArcs = [];
         state.techPaired = new Set();
@@ -1631,6 +1646,18 @@
                 // song's notes otherwise.
                 state.beats = Array.isArray(bundle.beats) ? bundle.beats : [];
                 state.sections = Array.isArray(bundle.sections) ? bundle.sections : [];
+                // Chord events + templates for the chord-box
+                // renderer. The note-tab renderer doesn't need
+                // these — _rebuildChart flattens chord notes into
+                // state.notes — but drawChordBoxes reads the raw
+                // chord events to position one diagram per chord
+                // change. Always overwrite (matches the
+                // beats/sections pattern above) so a song-change
+                // loading window doesn't leave the previous song's
+                // chord shapes scrolling behind the new chart.
+                state.chords = Array.isArray(bundle.chords) ? bundle.chords : [];
+                state.chordTemplates = Array.isArray(bundle.chordTemplates)
+                    ? bundle.chordTemplates : [];
 
                 // Rebuild trajectories only when the underlying
                 // chart arrays changed — either new song / arrangement
