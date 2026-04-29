@@ -1573,8 +1573,8 @@
 
     function drawNoteFrame(now) {
         if (!ctx || !noteCanvas) return;
-        const W = noteCanvas.clientWidth;
-        const H = noteCanvas.clientHeight;
+        const W = noteCanvas.clientWidth || noteCanvas.getBoundingClientRect().width;
+        const H = noteCanvas.clientHeight || noteCanvas.getBoundingClientRect().height;
         if (W === 0 || H === 0) return;
         const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
         const colors = colorsFor(nStrings);
@@ -1761,14 +1761,16 @@
 
     // ── Context-swap helpers for multi-instance rendering ───
     function _swapRenderTarget(newCanvas, newCtx, newState) {
-        const saved = { canvas, ctx, stateSnap: { ...state } };
-        canvas = newCanvas;
+        const saved = { noteCanvas, noteCtx, ctx, stateSnap: { ...state } };
+        noteCanvas = newCanvas;
+        noteCtx = newCtx;
         ctx = newCtx;
         Object.assign(state, newState);
         return saved;
     }
     function _restoreRenderTarget(saved) {
-        canvas = saved.canvas;
+        noteCanvas = saved.noteCanvas;
+        noteCtx = saved.noteCtx;
         ctx = saved.ctx;
         Object.assign(state, saved.stateSnap);
     }
@@ -1783,7 +1785,8 @@
         const localState = {
             filename: null, tuning: null, notes: [], arcs: [],
             techArcs: [], techPaired: new Set(), beats: [],
-            sections: [], songInfo: {}, ready: false, ws: null,
+            sections: [], chords: [], chordTemplates: [],
+            songInfo: {}, ready: false, ws: null,
         };
         let localRaf = null;
         let destroyed = false;
@@ -1807,7 +1810,7 @@
             const now = audioEl ? audioEl.currentTime : 0;
             sizeLocal();
             const saved = _swapRenderTarget(localCanvas, localCtx, localState);
-            drawFrame(now);
+            drawNoteFrame(now);
             _restoreRenderTarget(saved);
             localRaf = requestAnimationFrame(localTick);
         }
