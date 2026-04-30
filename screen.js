@@ -1,34 +1,107 @@
+// Jumping Tab visualization plugin — Yousician-style hopping-ball
+// tablature view. A glowing ball hops along a parabolic trajectory
+// from note to note on a 6-string (or 4-string bass) canvas tab.
+//
+// Wave C (slopsmith#36): per-instance refactor. Earlier Wave B
+// landed setRenderer support with an explicit single-instance
+// module-state assumption (one canvas wrapper, one chart cache,
+// one trajectory list). Wave C lifts that: rendering canvas, chart
+// caches, trajectory + technique arc caches, and listener refs are
+// now all per-instance (closured inside createFactory). Main-player
+// usage keeps its single-instance fast path; under splitscreen each
+// panel gets its own state, so N panels can render different
+// arrangements of the same song without cache cross-talk.
+//
+// Pure helpers (geometry / time→x mappings / trajectory builder /
+// bezier interpolation / range search) stay at module scope —
+// they're stateless and the test harness exercises them directly.
+//
+// Draw functions take (ctx, state) as their first arguments so the
+// same set of routines can render either a per-instance factory
+// state OR the standalone demo state. The demo harness
+// (window.__jumpingtab_state / window.__jumpingtab_demo) preserves
+// its module-level mini-state so existing test.html bindings keep
+// working without changes.
+//
+// Trajectory cache multiplies by N under splitscreen: each panel
+// rebuilds its own trajectories on first draw whenever bundle.notes
+// / bundle.chords reference-change. Acceptable cost — trajectories
+// are cheap and the cache hit rate is still ~100% within a song.
+
 (function () {
     'use strict';
 
     // ── Constants ─────────────────────────────────────────────
+    // Visual lookahead window: 5.5 seconds matches renanboni's
+    // fork (preferred over byrongamatos's 8.0 — shorter window,
+    // larger note rendering, easier to read at speed).
     const AHEAD = 5.5;
     const BEHIND = 1.2;
     const HIT_LINE_FRAC = 0.18;
     const FADE_SECONDS = 1.0;
     const SQUASH_WINDOW_MS = 60;
-    const IMPACT_DURATION = 0.45;   // seconds — ring expansion after a note crosses the hit line
-    const DISABLE_RINGS = true;   // set to true to disable expanding rings on note hits
-    const TOP_PAD = 60;           // room for header strip
-    const BOTTOM_PAD = 36;        // room for progress bar
-    const HIT_ZONE_WIDTH = 56;    // wide glowing strip around hit line
-    const EDGE_FADE_FRAC = 0.06;  // % of canvas width to fade at edges
+    const IMPACT_DURATION = 0.45;
+    // Renanboni / alleexx's preference: opt out of the impact-ring
+    // animation when notes cross the hit line. The ring code still
+    // runs (drawImpacts is part of the standard draw chain) but
+    // returns early when this flag is true.
+    const DISABLE_RINGS = true;
+    const TOP_PAD = 60;
+    const BOTTOM_PAD = 36;
+    const HIT_ZONE_WIDTH = 56;
+    const EDGE_FADE_FRAC = 0.06;
+    // Note radius preferences from renanboni: fatter notes + a
+    // consistent base/max so circles stay readable at speed.
     const NOTE_BASE_R = 18;
-    const NOTE_MAX_R = 18;        // consistent radius for all notes
+    const NOTE_MAX_R = 18;
     const HEADER_H = 36;
+    const MIN_NOTE_R = 6;
 
-    const GUITAR_COLORS = ['#ff6b8b', '#ffe66b', '#6bd5ff', '#ffa56b', '#6bff95', '#c56bff'];
-    const BASS_COLORS   = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff'];
+    // Per-string colors. Order matches renanboni's
+    // Rocksmith-aligned palette — string 0 (high E) is pink, string
+    // 1 (B) is yellow, string 2 (G) is cyan, etc. — instead of
+    // byrongamatos's earlier order. Extended-range positions 6 / 7
+    // (7-string / 8-string guitars from GP imports) are added on
+    // top of renanboni's 6-color palette.
+    // BASS_COLORS covers 4-string bass + 5-string bass (its 5th
+    // color reuses GUITAR_COLORS[5] for warmth).
+    // Lookups still fall back to FALLBACK_COLOR via the
+    // `|| FALLBACK_COLOR` guards in the draw* functions.
+    const GUITAR_COLORS = [
+        '#ff6b8b', '#ffe66b', '#6bd5ff', '#ffa56b', '#6bff95', '#c56bff',
+        '#ff6bd5', '#6bffe6',  // 7th = pink, 8th = aqua
+    ];
+    const BASS_COLORS = ['#ff6b8b', '#ffe66b', '#6bff95', '#6bd5ff', '#c56bff'];
+    const FALLBACK_COLOR = '#888888';
 
-    // ── Pure helpers ──────────────────────────────────────────
+    // ── Section color palette (cycled) ──────────────────────
+    const SECTION_COLORS = [
+        'rgba(110, 231, 255, 0.10)',  // cyan
+        'rgba(183, 134, 255, 0.10)',  // purple
+        'rgba(107, 255, 149, 0.10)',  // green
+        'rgba(255, 194, 107, 0.10)',  // orange
+        'rgba(255, 107, 139, 0.10)',  // pink
+    ];
+
+    // ── Pure helpers (stateless — test harness exercises these) ──
+
     function stringY(s, height, nStrings) {
         const usable = height - TOP_PAD - BOTTOM_PAD;
         const gap = usable / (nStrings - 1);
         return TOP_PAD + s * gap;
     }
 
+    function yFor(s, H, nStrings) {
+        return stringY(nStrings - 1 - s, H, nStrings);
+    }
+
     function colorsFor(nStrings) {
-        return nStrings === 4 ? BASS_COLORS : GUITAR_COLORS;
+        // Bass arrangements (4 or 5 strings) use the warm BASS_COLORS
+        // palette; everything else (6, 7, 8 strings) uses the wider
+        // GUITAR_COLORS rainbow. Out-of-range indices (>= the chosen
+        // palette length) get a neutral gray fallback at lookup
+        // sites — the palette being short doesn't poison rendering.
+        return nStrings <= 5 ? BASS_COLORS : GUITAR_COLORS;
     }
 
     function timeX(t, now, width) {
@@ -40,14 +113,12 @@
     function binaryVisibleRange(notes, now) {
         const lo = now - BEHIND;
         const hi = now + AHEAD;
-        // first index with t >= lo
         let l = 0, r = notes.length;
         while (l < r) {
             const m = (l + r) >> 1;
             if (notes[m].t < lo) l = m + 1; else r = m;
         }
         const start = l;
-        // first index with t > hi
         l = start; r = notes.length;
         while (l < r) {
             const m = (l + r) >> 1;
@@ -57,17 +128,7 @@
     }
 
     function buildTrajectories(notes) {
-        // Group notes by (near-)timestamp, preserving sort order. A group
-        // with more than one note is a chord. We emit an arc between every
-        // two consecutive groups so the ball always has somewhere to go —
-        // chord→chord included. For chord endpoints we use the average
-        // string index (float) so the arc visually lands on the centroid
-        // of the chord stack rather than one arbitrary string.
         if (notes.length < 2) return [];
-
-        // Server rounds note times to 3 decimal places (ms precision), so
-        // chord notes arrive with byte-identical floats. Keep a small
-        // epsilon so any rounding drift upstream still groups them.
         const EPS = 1e-4;
         const groups = [];
         let i = 0;
@@ -82,7 +143,6 @@
                 t,
                 notes: slice,
                 sAvg: sSum / slice.length,
-                // Representative fret — used only for logging/debug
                 f: slice[0].f,
             });
             i = j;
@@ -101,66 +161,23 @@
         return arcs;
     }
 
-    // Map a numeric bend amount (in semitones) to the label conventionally
-    // shown in guitar tablature. 0.5 → ½, 1 → "full", 1.5 → 1½, etc.
-    function bendText(bn) {
-        if (!bn || bn <= 0) return '';
-        if (bn === 0.5) return '\u00BD';
-        if (bn === 1) return 'full';
-        if (bn === 1.5) return '1\u00BD';
-        if (bn === 2) return '2';
-        if (bn === 2.5) return '2\u00BD';
-        if (bn >= 3) return String(Math.round(bn));
-        return bn.toFixed(1);
-    }
-
-    function bezierPoint(x0, y0, cx, cy, x1, y1, u) {
-        const v = 1 - u;
-        return {
-            x: v * v * x0 + 2 * v * u * cx + u * u * x1,
-            y: v * v * y0 + 2 * v * u * cy + u * u * y1,
-        };
-    }
-
-    // ── Exports for test harness ──────────────────────────────
-    window.__jumpingtab_core = {
-        stringY, colorsFor, timeX, binaryVisibleRange, buildTrajectories, bezierPoint,
-        AHEAD, BEHIND, HIT_LINE_FRAC,
-    };
-
-    // ── WS state ──────────────────────────────────────────────
-    const state = {
-        filename: null,
-        tuning: null,
-        notes: [],
-        arcs: [],
-        techArcs: [],
-        techPaired: new Set(),
-        beats: [],
-        sections: [],
-        songInfo: {},
-        ready: false,
-        ws: null,
-    };
-
-    // Build "technique arcs" — pairs of two notes on the same string where
-    // the second note has a hammer-on / pull-off / slide flag set. Walks
-    // the time-sorted notes array once; for each note with a technique
-    // flag, finds the most recent prior note on the same string and emits
-    // a pair. Returns {arcs, paired} where `paired` is a Set of note
-    // references that belong to any pair — used by drawNotes to skip
-    // them (drawTechniquePairs renders them as a fused capsule instead).
     function buildTechniqueArcs(notes) {
         const arcs = [];
         const paired = new Set();
-        const lastOnString = new Map();  // string index → last note object
+        const lastOnString = new Map();
         for (const n of notes) {
             const prev = lastOnString.get(n.s);
             if (prev) {
                 let type = null;
                 if (n.ho) type = 'h';
                 else if (n.po) type = 'p';
-                else if (n.sl && n.sl > 0) type = 's';
+                // Slide target fret is encoded as >= 0 for a real
+                // slide and -1 (or null / undefined) for "no slide".
+                // 0 is a legal target — a slide INTO an open string —
+                // and _rebuildChart uses `sl ?? -1` to preserve it;
+                // the old `n.sl && n.sl > 0` check contradicted that
+                // by silently dropping slides-to-open.
+                else if (n.sl != null && n.sl >= 0) type = 's';
                 if (type) {
                     arcs.push({
                         t0: prev.t, t1: n.t, s: n.s, type,
@@ -176,268 +193,73 @@
         return { arcs, paired };
     }
 
-    function connect(filename, arrangementIdx) {
-        return new Promise((resolve, reject) => {
-            // Close any prior socket
-            if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
-            state.filename = filename;
-            state.tuning = null;
-            state.notes = [];
-            state.arcs = [];
-            state.techArcs = [];
-            state.techPaired = new Set();
-            state.beats = [];
-            state.sections = [];
-            state.chords = [];
-            state.chordTemplates = [];
-            state.songInfo = {};
-            state.ready = false;
-
-            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const qs = (arrangementIdx != null && arrangementIdx >= 0)
-                ? `?arrangement=${arrangementIdx}` : '';
-            const url = `${proto}//${location.host}/ws/highway/${decodeURIComponent(filename)}${qs}`;
-            const ws = new WebSocket(url);
-            state.ws = ws;
-
-            let singleNotesCount = 0;
-            let chordNotesCount = 0;
-
-            const finalize = () => {
-                if (state.ready) return;
-                state.notes.sort((a, b) => a.t - b.t);
-                state.chords.sort((a, b) => a.t - b.t);
-
-                // Precompute per-note neighbor gaps (in seconds) for
-                // same-string neighbors, so drawNotes can clamp the
-                // radius and avoid visual overlap in dense passages.
-                // Chord teammates share a timestamp — skip those via
-                // an epsilon check.
-                const lastIdxByString = new Map();
-                const EPS_T = 1e-4;
-                for (let i = 0; i < state.notes.length; i++) {
-                    const n = state.notes[i];
-                    n._gapL = Infinity;
-                    n._gapR = Infinity;
-                    const prevIdx = lastIdxByString.get(n.s);
-                    if (prevIdx != null) {
-                        const prev = state.notes[prevIdx];
-                        const gap = n.t - prev.t;
-                        if (gap > EPS_T) {
-                            n._gapL = gap;
-                            if (gap < prev._gapR) prev._gapR = gap;
-                        }
-                    }
-                    lastIdxByString.set(n.s, i);
-                }
-
-                state.arcs = buildTrajectories(state.notes);
-                const tech = buildTechniqueArcs(state.notes);
-                state.techArcs = tech.arcs;
-                state.techPaired = tech.paired;
-                state.ready = true;
-                console.log('[jumpingtab] ready —',
-                    singleNotesCount, 'single notes +',
-                    chordNotesCount, 'chord notes =',
-                    state.notes.length, 'total,',
-                    state.chords.length, 'chords,',
-                    state.chordTemplates.length, 'templates,',
-                    state.techArcs.length, 'technique arcs');
-                resolve(state);
-            };
-
-            // Identity-gate all handlers: if the user picks a different song
-            // before this one finishes loading, state.ws is replaced. Old
-            // handlers continue firing — ignore them so they can't mutate
-            // the new song's state.
-            ws.onmessage = (ev) => {
-                if (state.ws !== ws) return;
-                let msg;
-                try { msg = JSON.parse(ev.data); } catch (e) { return; }
-                if (msg.error) { reject(new Error(msg.error)); ws.close(); return; }
-                if (msg.type === 'song_info') {
-                    state.tuning = msg.tuning || [0,0,0,0,0,0];
-                    state.songInfo = {
-                        title: msg.title || '',
-                        artist: msg.artist || '',
-                        arrangement: msg.arrangement || '',
-                        duration: msg.duration || 0,
-                    };
-                    const mode = state.tuning.length === 4 ? 'bass (4)' : 'guitar (6)';
-                    console.log('[jumpingtab] arrangement:', msg.arrangement, '— mode:', mode);
-                } else if (msg.type === 'sections') {
-                    state.sections = msg.data || [];
-                } else if (msg.type === 'notes') {
-                    // Single (non-chord) notes
-                    for (const n of msg.data) state.notes.push(n);
-                    singleNotesCount = state.notes.length;
-                } else if (msg.type === 'chord_templates') {
-                    // Store chord templates as an array so IDs match chord events.
-                    state.chordTemplates = msg.data || [];
-                    console.log('[jumpingtab] received', state.chordTemplates.length, 'chord templates');
-                } else if (msg.type === 'chords') {
-                    // Store chord events (time-based) AND expand into individual notes.
-                    // Chord events: {t, id, hd, notes}
-                    state.chords = state.chords.concat(msg.data || []);
-                    for (const c of msg.data || []) {
-                        for (const cn of c.notes) {
-                            state.notes.push({
-                                t: c.t,
-                                s: cn.s,
-                                f: cn.f,
-                                sus: cn.sus || 0,
-                                ho: cn.ho || 0,
-                                po: cn.po || 0,
-                                sl: cn.sl || -1,
-                                bn: cn.bn || 0,
-                            });
-                            chordNotesCount++;
-                        }
-                    }
-                    console.log('[jumpingtab] received', (msg.data || []).length, 'chords');
-                } else if (msg.type === 'beats') {
-                    // Store beats for measure-bar rendering in drawBackground
-                    state.beats = msg.data || [];
-                } else if (msg.type === 'ready') {
-                    // Server has finished streaming notes + chords
-                    finalize();
-                }
-            };
-            ws.onerror = () => {
-                if (state.ws !== ws) return;
-                if (!state.ready) reject(new Error('ws error'));
-            };
-            ws.onclose = () => {
-                if (state.ws !== ws) return;
-                if (!state.ready) reject(new Error('ws closed before ready'));
-            };
-        });
+    function bendText(bn) {
+        if (!bn || bn <= 0) return '';
+        if (bn === 0.5) return '½';
+        if (bn === 1) return 'full';
+        if (bn === 1.5) return '1½';
+        if (bn === 2) return '2';
+        if (bn === 2.5) return '2½';
+        if (bn >= 3) return String(Math.round(bn));
+        return bn.toFixed(1);
     }
 
-    // ── Canvas lifecycle ─────────────────────────────────────
-    let active = false;
-    let wrap = null;
-    let noteCanvas = null;
-    let chordCanvas = null;
-    let noteCtx = null;
-    let chordCtx = null;
-    let ctx = null;
-    let raf = null;
-    let audioEl = null;
-
-    // Player-view Y mapping: low E (highest string index) at top, high e
-    // (index 0) at bottom — matches what you see when looking down at your
-    // own guitar. Keeps stringY pure (tests untouched) and just inverts
-    // the index at the call site.
-    function yFor(s, H, nStrings) {
-        return stringY(nStrings - 1 - s, H, nStrings);
+    function bezierPoint(x0, y0, cx, cy, x1, y1, u) {
+        const v = 1 - u;
+        return {
+            x: v * v * x0 + 2 * v * u * cx + u * u * x1,
+            y: v * v * y0 + 2 * v * u * cy + u * u * y1,
+        };
     }
 
-    // Size the backing store to the canvas's on-screen CSS pixels, respecting
-    // device pixel ratio so the result is crisp on retina. Called on mount
-    // and on window resize. The canvas itself takes its display size from
-    // CSS (flex: 1), so we only touch width/height and the ctx transform.
-    function sizeCanvasToBox() {
-        if (!noteCanvas || !noteCtx || !chordCanvas || !chordCtx) return;
-        const noteRect = noteCanvas.getBoundingClientRect();
-        const chordRect = chordCanvas.getBoundingClientRect();
-        const dpr = (window.devicePixelRatio || 1) * 1.35;
+    function noteRadius(x, hitX, W) {
+        const dxRight = Math.abs(x - hitX);
+        const span = Math.max(hitX, W - hitX);
+        const t = 1 - Math.min(1, dxRight / (span * 0.6));
+        return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
+    }
 
-        const notePxW = Math.max(1, Math.floor(noteRect.width * dpr));
-        const notePxH = Math.max(1, Math.floor(noteRect.height * dpr));
-        if (noteCanvas.width !== notePxW || noteCanvas.height !== notePxH) {
-            noteCanvas.width = notePxW;
-            noteCanvas.height = notePxH;
+    function secondsToPx(seconds, W) {
+        const hitX = W * HIT_LINE_FRAC;
+        return seconds * (W - hitX) / AHEAD;
+    }
+
+    function clampByNeighbors(baseR, n, W) {
+        const gap = Math.min(n._gapL || Infinity, n._gapR || Infinity);
+        if (!isFinite(gap)) return baseR;
+        const gapPx = secondsToPx(gap, W);
+        const maxR = Math.max(MIN_NOTE_R, gapPx / 2 - 3);
+        return Math.min(baseR, maxR);
+    }
+
+    function arcControlPoint(x0, y0, x1, y1) {
+        const midX = (x0 + x1) / 2;
+        const dy = Math.abs(y1 - y0);
+        const rise = Math.min(70, 20 + dy * 1.2);
+        const midY = Math.min(y0, y1) - rise;
+        return { cx: midX, cy: midY };
+    }
+
+    function findActiveArc(arcs, now) {
+        let best = null;
+        for (const a of arcs) {
+            if (a.t0 <= now && now <= a.t1) return a;
+            if (a.t1 < now && (!best || a.t1 > best.t1)) best = a;
         }
-        noteCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return best;
+    }
 
-        const chordPxW = Math.max(1, Math.floor(chordRect.width * dpr));
-        const chordPxH = Math.max(1, Math.floor(chordRect.height * dpr));
-        if (chordCanvas.width !== chordPxW || chordCanvas.height !== chordPxH) {
-            chordCanvas.width = chordPxW;
-            chordCanvas.height = chordPxH;
+    function nearestNoteAtHit(notes, now, hitX, W) {
+        const { start, end } = binaryVisibleRange(notes, now);
+        let best = null, bestDx = Infinity;
+        for (let i = start; i < end; i++) {
+            const n = notes[i];
+            const x = timeX(n.t, now, W);
+            const dx = Math.abs(x - hitX);
+            if (dx < bestDx) { bestDx = dx; best = { note: n, dx, x }; }
         }
-        chordCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return best;
     }
-
-    function mountCanvas() {
-        const player = document.getElementById('player');
-        const hw = document.getElementById('highway');
-        if (!player || !hw) return false;
-
-        // Wrapper takes the highway's flex slot and stacks the chord and note canvases.
-        wrap = document.createElement('div');
-        wrap.id = 'jumpingtab-wrap';
-        wrap.style.cssText = [
-            'flex:1',
-            'min-height:0',
-            'display:flex',
-            'flex-direction:column',
-            'align-items:stretch',
-            'justify-content:flex-start',
-            'padding:0',
-            'gap:12px',
-            'width:100%',
-            'max-width:none',
-            'height:100%',
-            'box-sizing:border-box',
-        ].join(';');
-
-        chordCanvas = document.createElement('canvas');
-        chordCanvas.id = 'jumpingtab-chord-canvas';
-        chordCanvas.style.cssText = [
-            'width:100%',
-            'flex:0.35',
-            'min-height:0',
-            'display:block',
-            'background:#090f18',
-            'border-radius:10px',
-            'box-shadow:0 8px 24px rgba(0,0,0,0.3)',
-        ].join(';');
-
-        noteCanvas = document.createElement('canvas');
-        noteCanvas.id = 'jumpingtab-canvas';
-        noteCanvas.style.cssText = [
-            'width:100%',
-            'flex:0.65',
-            'min-height:0',
-            'display:block',
-            'background:#0f1420',
-            'border-radius:10px',
-            'box-shadow:0 8px 24px rgba(0,0,0,0.4)',
-        ].join(';');
-
-        wrap.appendChild(chordCanvas);
-        wrap.appendChild(noteCanvas);
-        hw.insertAdjacentElement('afterend', wrap);
-
-        chordCtx = chordCanvas.getContext('2d');
-        noteCtx = noteCanvas.getContext('2d');
-        ctx = noteCtx;
-        hw.style.display = 'none';
-        audioEl = document.querySelector('audio');
-        sizeCanvasToBox();
-        window.addEventListener('resize', sizeCanvasToBox);
-        return true;
-    }
-
-    function unmountCanvas() {
-        if (raf) { cancelAnimationFrame(raf); raf = null; }
-        window.removeEventListener('resize', sizeCanvasToBox);
-        if (wrap) { wrap.remove(); wrap = null; noteCanvas = null; chordCanvas = null; noteCtx = null; chordCtx = null; ctx = null; }
-        const hw = document.getElementById('highway');
-        if (hw) hw.style.display = '';
-        audioEl = null;
-    }
-
-    // ── Section color palette (cycled) ──────────────────────
-    const SECTION_COLORS = [
-        'rgba(110, 231, 255, 0.10)',  // cyan
-        'rgba(183, 134, 255, 0.10)',  // purple
-        'rgba(107, 255, 149, 0.10)',  // green
-        'rgba(255, 194, 107, 0.10)',  // orange
-        'rgba(255, 107, 139, 0.10)',  // pink
-    ];
 
     function currentSection(sections, now) {
         if (!sections || !sections.length) return null;
@@ -449,9 +271,147 @@
         return cur;
     }
 
-    // ── Renderer ─────────────────────────────────────────────
-    function drawBackground(W, H, nStrings, colors, now) {
-        // Base fill — rich navy with a soft radial vignette
+    // ── Pure-state factory (used by both factory instances and demo) ──
+
+    function _newState() {
+        return {
+            tuning: null,
+            // Chord events (with .t and .id referencing into
+            // chordTemplates) — populated each frame from
+            // bundle.chords. The chord-box renderer
+            // (drawChordBoxes) reads these directly; the existing
+            // note-tab renderer flattens chords into state.notes
+            // via _rebuildChart so it doesn't need them.
+            chords: [],
+            // Chord-template lookup table (slopsmith#92) — index
+            // by chord.id to get { name, fingers, frets }. Read-
+            // only; empty array means "no chord shapes available
+            // for this song" (common for GP imports without
+            // chord-shape annotations).
+            chordTemplates: [],
+            // Active string count from bundle.stringCount (slopsmith#93).
+            // null = not yet known; drawFrame resolves the active
+            // count by trying state.stringCount first, then any
+            // positive state.tuning.length, finally falling back to
+            // 6 (canonical guitar count). The 5-string-bass /
+            // 7-string-guitar paths flow through tuning.length when
+            // bundle.stringCount is unavailable from older cores.
+            stringCount: null,
+            notes: [],
+            arcs: [],
+            techArcs: [],
+            techPaired: new Set(),
+            beats: [],
+            sections: [],
+            songInfo: {},
+            ready: false,
+        };
+    }
+
+    // Flatten bundle.notes + bundle.chords into the single sorted
+    // array the rest of this module expects, then precompute
+    // per-note same-string neighbor gaps (needed by drawNotes'
+    // radius clamp). Mutates `state` in place — the per-instance
+    // state object passed by the factory or the demo harness's
+    // module-level demo state.
+    function _rebuildChart(state, notes, chords) {
+        const flat = [];
+        if (Array.isArray(notes)) {
+            // Clone rather than pushing the upstream note object
+            // directly. The gap precomputation below sets _gapL /
+            // _gapR as instance fields, which would mutate the
+            // bundle.notes entries owned by slopsmith core and
+            // visible to every other renderer sharing the same
+            // array. It would also throw in strict mode against
+            // any frozen / sealed note object. The shape mirrors
+            // the chord-expansion branch below so later drawing
+            // code doesn't branch on "where did this note come from".
+            for (const n of notes) {
+                flat.push({
+                    t: n.t,
+                    s: n.s,
+                    f: n.f,
+                    sus: n.sus || 0,
+                    ho: n.ho || 0,
+                    po: n.po || 0,
+                    // `??` not `||` — `sl` (slide target fret) can
+                    // legitimately be 0 (slide into an open string).
+                    // `0 || -1` would collapse that to "no slide" and
+                    // drawTechniqueArcs would stop drawing the slide
+                    // indicator above those notes. sus / ho / po / bn
+                    // use `||` safely because their falsy default and
+                    // their no-op numeric value are the same (0).
+                    sl: n.sl ?? -1,
+                    bn: n.bn || 0,
+                });
+            }
+        }
+        if (Array.isArray(chords)) {
+            for (const c of chords) {
+                if (!c || !Array.isArray(c.notes)) continue;
+                for (const cn of c.notes) {
+                    flat.push({
+                        t: c.t,
+                        s: cn.s,
+                        f: cn.f,
+                        sus: cn.sus || 0,
+                        ho: cn.ho || 0,
+                        po: cn.po || 0,
+                        sl: cn.sl ?? -1,  // see single-note branch above
+                        bn: cn.bn || 0,
+                    });
+                }
+            }
+        }
+        flat.sort((a, b) => a.t - b.t);
+
+        const lastIdxByString = new Map();
+        const EPS_T = 1e-4;
+        for (let i = 0; i < flat.length; i++) {
+            const n = flat[i];
+            n._gapL = Infinity;
+            n._gapR = Infinity;
+            const prevIdx = lastIdxByString.get(n.s);
+            if (prevIdx != null) {
+                const prev = flat[prevIdx];
+                const gap = n.t - prev.t;
+                if (gap > EPS_T) {
+                    n._gapL = gap;
+                    if (gap < prev._gapR) prev._gapR = gap;
+                }
+            }
+            lastIdxByString.set(n.s, i);
+        }
+
+        state.notes = flat;
+        state.arcs = buildTrajectories(flat);
+        const tech = buildTechniqueArcs(flat);
+        state.techArcs = tech.arcs;
+        state.techPaired = tech.paired;
+        state.ready = flat.length > 0;
+    }
+
+    function _clearChart(state) {
+        state.notes = [];
+        state.chords = [];
+        state.chordTemplates = [];
+        state.arcs = [];
+        state.techArcs = [];
+        state.techPaired = new Set();
+        state.beats = [];
+        state.sections = [];
+        state.songInfo = {};
+        state.tuning = null;
+        state.stringCount = null;
+        state.ready = false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Renderers — accept (ctx, state) so the same routines drive both
+    // per-instance factory state and the standalone demo harness.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function drawBackground(ctx, state, W, H, nStrings, colors, now) {
         ctx.fillStyle = '#070b18';
         ctx.fillRect(0, 0, W, H);
 
@@ -459,8 +419,6 @@
         const botBand = H - BOTTOM_PAD;
         const laneH = botBand - topBand;
 
-        // Lane panel — slightly lighter, with rounded top/bottom so the
-        // strings sit inside a visible "tab strip"
         const laneGrad = ctx.createLinearGradient(0, topBand, 0, botBand);
         laneGrad.addColorStop(0, '#0d1428');
         laneGrad.addColorStop(0.5, '#0a1024');
@@ -468,7 +426,6 @@
         ctx.fillStyle = laneGrad;
         ctx.fillRect(0, topBand, W, laneH);
 
-        // Section bands — subtle colored backgrounds keyed to their time range
         if (state.sections && state.sections.length) {
             const lo = now - BEHIND;
             const hi = now + AHEAD;
@@ -485,7 +442,6 @@
             }
         }
 
-        // Beat / measure lines — thin verticals inside the lane
         if (state.beats && state.beats.length) {
             const lo = now - BEHIND;
             const hi = now + AHEAD;
@@ -502,7 +458,6 @@
             }
         }
 
-        // Hit zone — a vertical gradient strip centered on the hit line
         const hitX = W * HIT_LINE_FRAC;
         const zoneL = hitX - HIT_ZONE_WIDTH / 2;
         const zoneR = hitX + HIT_ZONE_WIDTH / 2;
@@ -513,18 +468,49 @@
         ctx.fillStyle = zoneGrad;
         ctx.fillRect(zoneL, topBand, HIT_ZONE_WIDTH, laneH);
 
-        // String lines — colored, drawn inside the lane
         ctx.lineWidth = 1.5;
         for (let s = 0; s < nStrings; s++) {
             const y = yFor(s, H, nStrings);
-            ctx.strokeStyle = colors[s] + '60';
+            ctx.strokeStyle = (colors[s] || FALLBACK_COLOR) + '60';
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(W, y);
             ctx.stroke();
         }
 
-        // Hit line — crisp bright line in the middle of the zone
+        ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'center';
+        // String labels for the small note-letter circles. Lookup
+        // table keyed by stringCount so adding new instruments later
+        // is a single-line change (rather than another nested
+        // ternary branch). Out-of-table values fall through to the
+        // 8-string layout so 9+-string instruments at least get
+        // sensible labels for their first 8 lanes — string indices
+        // beyond that draw the circle without a letter via the
+        // `labels[s] || ''` guard at the call site.
+        const LABEL_SETS = {
+            4: ['G', 'D', 'A', 'E'],
+            5: ['G', 'D', 'A', 'E', 'B'],
+            6: ['e', 'B', 'G', 'D', 'A', 'E'],
+            7: ['e', 'B', 'G', 'D', 'A', 'E', 'B'],
+            8: ['e', 'B', 'G', 'D', 'A', 'E', 'B', 'F#'],
+        };
+        const labels = LABEL_SETS[nStrings] || LABEL_SETS[8];
+        for (let s = 0; s < nStrings; s++) {
+            const y = yFor(s, H, nStrings);
+            const stringColor = colors[s] || FALLBACK_COLOR;
+            ctx.fillStyle = 'rgba(15, 20, 32, 0.88)';
+            ctx.beginPath();
+            ctx.arc(16, y, 10, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = stringColor + '80';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.fillStyle = stringColor;
+            ctx.fillText(labels[s] || '', 16, y + 0.5);
+        }
+
         ctx.save();
         ctx.shadowColor = '#6ee7ff';
         ctx.shadowBlur = 24;
@@ -537,29 +523,7 @@
         ctx.restore();
     }
 
-    // Edge fade — draw dark gradients at the left and right edges so notes
-    // don't pop in/out. Called AFTER notes so it overlays everything in
-    // the lane area.
-    function drawStringLabels(W, H, nStrings, colors) {
-        ctx.font = 'bold 12px "SF Mono", Menlo, monospace';
-        ctx.textBaseline = 'middle';
-        ctx.textAlign = 'center';
-        const labels = nStrings === 4 ? ['E','A','D','G'] : ['E','A','D','G','B','e'];
-        for (let s = 0; s < nStrings; s++) {
-            const y = yFor(s, H, nStrings);
-            ctx.fillStyle = 'rgba(15, 20, 32, 0.88)';
-            ctx.beginPath();
-            ctx.arc(16, y, 10, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = colors[s] + '80';
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-            ctx.fillStyle = colors[s];
-            ctx.fillText(labels[s], 16, y + 0.5);
-        }
-    }
-
-    function drawEdgeFade(W, H) {
+    function drawEdgeFade(ctx, W, H) {
         const topBand = TOP_PAD;
         const botBand = H - BOTTOM_PAD;
         const laneH = botBand - topBand;
@@ -578,19 +542,16 @@
         ctx.fillRect(W - fadeW, topBand, fadeW, laneH);
     }
 
-    // Header strip — song title / artist / arrangement / current section
-    function drawHeader(W, H, now) {
+    function drawHeader(ctx, state, W, H, now) {
         const info = state.songInfo || {};
         const sec = currentSection(state.sections, now);
 
-        // Header background — dark strip across the top
         const hdrGrad = ctx.createLinearGradient(0, 0, 0, HEADER_H);
         hdrGrad.addColorStop(0, 'rgba(12, 16, 30, 0.95)');
         hdrGrad.addColorStop(1, 'rgba(12, 16, 30, 0.6)');
         ctx.fillStyle = hdrGrad;
         ctx.fillRect(0, 0, W, HEADER_H);
 
-        // Left: title · artist
         ctx.font = '600 13px -apple-system, system-ui, sans-serif';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'left';
@@ -598,7 +559,6 @@
         const title = info.title || 'Unknown';
         ctx.fillText(title, 16, HEADER_H / 2);
 
-        // Artist subtitle
         const titleW = ctx.measureText(title).width;
         ctx.font = '400 12px -apple-system, system-ui, sans-serif';
         ctx.fillStyle = 'rgba(200, 210, 230, 0.55)';
@@ -606,7 +566,6 @@
             ctx.fillText('· ' + info.artist, 16 + titleW + 8, HEADER_H / 2);
         }
 
-        // Right: arrangement badge + current section
         ctx.textAlign = 'right';
         if (sec) {
             const label = sec.name || '';
@@ -633,8 +592,7 @@
         }
     }
 
-    // Progress bar along the bottom of the canvas
-    function drawProgress(W, H, now) {
+    function drawProgress(ctx, state, W, H, now) {
         const duration = (state.songInfo && state.songInfo.duration) || 0;
         if (duration <= 0) return;
 
@@ -643,7 +601,6 @@
         const barX = 16;
         const barW = W - 32;
 
-        // Track
         ctx.fillStyle = 'rgba(200, 210, 230, 0.12)';
         if (ctx.roundRect) {
             ctx.beginPath();
@@ -653,7 +610,6 @@
             ctx.fillRect(barX, barY, barW, barH);
         }
 
-        // Fill
         const pct = Math.max(0, Math.min(1, now / duration));
         const fillW = barW * pct;
         const fillGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
@@ -668,7 +624,6 @@
             ctx.fillRect(barX, barY, fillW, barH);
         }
 
-        // Time labels
         const fmt = (t) => {
             const m = Math.floor(t / 60);
             const s = Math.floor(t % 60);
@@ -683,37 +638,7 @@
         ctx.fillText(fmt(duration), barX + barW, barY - 8);
     }
 
-    // Distance-based radius: notes grow as they approach the hit line and
-    // shrink as they leave. Max at hitX, base at edges.
-    function noteRadius(x, hitX, W) {
-        const dxRight = Math.abs(x - hitX);
-        const span = Math.max(hitX, W - hitX);
-        const t = 1 - Math.min(1, dxRight / (span * 0.6));
-        return NOTE_BASE_R + (NOTE_MAX_R - NOTE_BASE_R) * Math.max(0, t);
-    }
-
-    // Convert a gap in seconds to a gap in canvas pixels at the current
-    // time-to-x mapping. The lane spans AHEAD seconds from hitX to the
-    // right edge, so 1 second = (W - hitX) / AHEAD pixels.
-    function secondsToPx(seconds, W) {
-        const hitX = W * HIT_LINE_FRAC;
-        return seconds * (W - hitX) / AHEAD;
-    }
-
-    // Clamp a note radius to whatever fits between its same-string
-    // neighbors at the current scale, with a floor so very dense runs
-    // still render a visible dot rather than shrinking to nothing.
-    const MIN_NOTE_R = 6;
-    function clampByNeighbors(baseR, n, W) {
-        const gap = Math.min(n._gapL || Infinity, n._gapR || Infinity);
-        if (!isFinite(gap)) return baseR;
-        const gapPx = secondsToPx(gap, W);
-        // Leave a 3px visual gutter between adjacent notes
-        const maxR = Math.max(MIN_NOTE_R, gapPx / 2 - 3);
-        return Math.min(baseR, maxR);
-    }
-
-    function drawSustains(W, H, nStrings, colors, now) {
+    function drawSustains(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const tailHeight = 8;
@@ -726,8 +651,7 @@
             const y = yFor(n.s, H, nStrings);
             ctx.save();
             ctx.globalAlpha = 0.55;
-            ctx.fillStyle = colors[n.s];
-            // Rounded rect
+            ctx.fillStyle = colors[n.s] || FALLBACK_COLOR;
             const r = tailHeight / 2;
             ctx.beginPath();
             ctx.moveTo(x0 + r, y - r);
@@ -743,48 +667,7 @@
         }
     }
 
-    function arcControlPoint(x0, y0, x1, y1) {
-        const midX = (x0 + x1) / 2;
-        const dy = Math.abs(y1 - y0);
-        const rise = Math.min(70, 20 + dy * 1.2);
-        const midY = Math.min(y0, y1) - rise;
-        return { cx: midX, cy: midY };
-    }
-
-    function drawArcs(W, H, nStrings, colors, now) {
-        if (!state.ready || !state.arcs.length) return;
-        const lo = now - BEHIND;
-        const hi = now + AHEAD;
-
-        ctx.save();
-        ctx.strokeStyle = '#6ee7ff';
-        ctx.globalAlpha = 0.7;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([5, 4]);
-
-        for (const arc of state.arcs) {
-            if (arc.t1 < lo || arc.t0 > hi) continue;
-            if (arc.s0 < 0 || arc.s0 >= nStrings) continue;
-            if (arc.s1 < 0 || arc.s1 >= nStrings) continue;
-            const x0 = timeX(arc.t0, now, W);
-            const y0 = yFor(arc.s0, H, nStrings);
-            const x1 = timeX(arc.t1, now, W);
-            const y1 = yFor(arc.s1, H, nStrings);
-            const { cx, cy } = arcControlPoint(x0, y0, x1, y1);
-            ctx.beginPath();
-            ctx.moveTo(x0, y0);
-            ctx.quadraticCurveTo(cx, cy, x1, y1);
-            ctx.stroke();
-        }
-
-        ctx.restore();
-    }
-
-    // Technique pairs — for HO/PO/slide pairs on the same string, render
-    // both notes as a single fused capsule (stadium shape) instead of two
-    // separate circles. Visually communicates "these belong together" and
-    // leaves room for the technique arc + letter above.
-    function drawTechniquePairs(W, H, nStrings, colors, now) {
+    function drawTechniquePairs(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.techArcs || !state.techArcs.length) return;
         const lo = now - BEHIND;
         const hi = now + AHEAD;
@@ -799,17 +682,13 @@
             const x0 = timeX(a.t0, now, W);
             const x1 = timeX(a.t1, now, W);
             const y = yFor(a.s, H, nStrings);
-            const color = colors[a.s];
+            const color = colors[a.s] || FALLBACK_COLOR;
 
-            // Radius clamped by outer neighbors — capsule shouldn't overlap
-            // the note before (via n0._gapL) or after (via n1._gapR).
             const leftClamp = a.n0 ? clampByNeighbors(NOTE_BASE_R, a.n0, W) : NOTE_BASE_R;
             const rightClamp = a.n1 ? clampByNeighbors(NOTE_BASE_R, a.n1, W) : NOTE_BASE_R;
             const R = Math.min(leftClamp, rightClamp);
             ctx.font = 'bold ' + Math.round(R * 0.95) + 'px "SF Mono", Menlo, monospace';
 
-            // Use the later note's time for fade so the capsule fades as
-            // a unit when it's behind the hit line.
             let alpha = 1;
             const dt = now - a.t1;
             if (dt > 0) {
@@ -820,7 +699,6 @@
             ctx.save();
             ctx.globalAlpha = alpha;
 
-            // Capsule body — stadium shape from (x0-R) to (x1+R), height 2R
             const left = x0 - R;
             const top = y - R;
             const width = (x1 - x0) + 2 * R;
@@ -833,7 +711,6 @@
             if (ctx.roundRect) {
                 ctx.roundRect(left, top, width, height, R);
             } else {
-                // Fallback for very old browsers
                 ctx.moveTo(left + R, top);
                 ctx.lineTo(left + width - R, top);
                 ctx.arc(left + width - R, y, R, -Math.PI / 2, Math.PI / 2);
@@ -843,13 +720,11 @@
             }
             ctx.fill();
 
-            // White outline
             ctx.shadowBlur = 0;
             ctx.lineWidth = 2;
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
             ctx.stroke();
 
-            // Fret numbers at each end
             ctx.fillStyle = '#0a0f1c';
             ctx.fillText(String(a.f0), x0, y + 1);
             ctx.fillText(String(a.f1), x1, y + 1);
@@ -858,11 +733,7 @@
         }
     }
 
-    // Technique arcs — curves above the notes on the same string for
-    // hammer-on (h), pull-off (p), or slide (s). These sit above the note
-    // row as a solid curve with a small letter label, mirroring standard
-    // tab notation.
-    function drawTechniqueArcs(W, H, nStrings, colors, now) {
+    function drawTechniqueArcs(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.techArcs || !state.techArcs.length) return;
         const lo = now - BEHIND;
         const hi = now + AHEAD;
@@ -879,14 +750,12 @@
             if (a.s < 0 || a.s >= nStrings) continue;
             const x0 = timeX(a.t0, now, W);
             const x1 = timeX(a.t1, now, W);
-            if (x1 - x0 < 6) continue;  // too close to be legible
+            if (x1 - x0 < 6) continue;
             const y = yFor(a.s, H, nStrings);
-            // Curve sits ~18px above the note row
             const lift = 20;
             const cx = (x0 + x1) / 2;
             const cy = y - lift;
 
-            // Color codes: hammer-on cyan-ish, pull-off warm, slide white
             const color = a.type === 'h' ? '#ffc86b'
                         : a.type === 'p' ? '#ff8ab6'
                         : '#ffffff';
@@ -897,7 +766,6 @@
             ctx.quadraticCurveTo(cx, cy, x1, y - 4);
             ctx.stroke();
 
-            // Letter label centered above the curve
             ctx.globalAlpha = 1;
             ctx.fillStyle = color;
             ctx.fillText(a.type, cx, cy + 1);
@@ -906,32 +774,7 @@
         ctx.restore();
     }
 
-    function findActiveArc(arcs, now) {
-        // Linear scan is fine — arcs.length is in the hundreds, this is 60fps-safe.
-        // Return the arc whose [t0, t1] contains now, or the most-recent past arc
-        // if we're between arcs (rest).
-        let best = null;
-        for (const a of arcs) {
-            if (a.t0 <= now && now <= a.t1) return a;
-            if (a.t1 < now && (!best || a.t1 > best.t1)) best = a;
-        }
-        return best;
-    }
-
-    function nearestNoteAtHit(notes, now, hitX, W) {
-        // Find the note whose current x is closest to the hit line.
-        const { start, end } = binaryVisibleRange(notes, now);
-        let best = null, bestDx = Infinity;
-        for (let i = start; i < end; i++) {
-            const n = notes[i];
-            const x = timeX(n.t, now, W);
-            const dx = Math.abs(x - hitX);
-            if (dx < bestDx) { bestDx = dx; best = { note: n, dx, x }; }
-        }
-        return best;
-    }
-
-    function drawBall(W, H, nStrings, colors, now) {
+    function drawBall(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.arcs.length) return;
         const arc = findActiveArc(state.arcs, now);
         if (!arc) return;
@@ -945,14 +788,13 @@
         const u = Math.max(0, Math.min(1, (now - arc.t0) / Math.max(0.0001, arc.t1 - arc.t0)));
         const p = bezierPoint(x0, y0, cx, cy, x1, y1, u);
 
-        // Squash when we're inside SQUASH_WINDOW_MS of any note crossing the hit line
         const hitX = W * HIT_LINE_FRAC;
         const nearest = nearestNoteAtHit(state.notes, now, hitX, W);
         let sx = 1, sy = 1;
         if (nearest && nearest.dx < 14) {
             const msFromNote = Math.abs(now - nearest.note.t) * 1000;
             if (msFromNote < SQUASH_WINDOW_MS) {
-                const k = 1 - (msFromNote / SQUASH_WINDOW_MS);  // 1 at t=note, 0 at edge
+                const k = 1 - (msFromNote / SQUASH_WINDOW_MS);
                 sx = 1 + 0.25 * k;
                 sy = 1 - 0.40 * k;
             }
@@ -963,7 +805,6 @@
         ctx.shadowBlur = 18;
         ctx.translate(p.x, p.y);
         ctx.scale(sx, sy);
-        // Layered ball: outer glow ring + inner bright core
         ctx.fillStyle = 'rgba(166, 240, 255, 0.6)';
         ctx.beginPath();
         ctx.arc(0, 0, 11, 0, Math.PI * 2);
@@ -976,12 +817,13 @@
         ctx.restore();
     }
 
-    // Impact rings — when a note crosses the hit line, fire a ring that
-    // stays anchored at (hitX, string y) and expands outward while fading,
-    // colored to match the string. Gives the "I hit that one" feedback.
-    // Also draws a brief full-string flash line so the impact feels like
-    // it energises the string.
-    function drawImpacts(W, H, nStrings, colors, now) {
+    function drawImpacts(ctx, state, W, H, nStrings, colors, now) {
+        // DISABLE_RINGS: renanboni / alleexx's preference — the
+        // expanding-ring animation on hit-line crossings was too
+        // visually busy. Skipping the per-note ring work here also
+        // saves a hot-path scan over visible notes when the feature
+        // is off.
+        if (DISABLE_RINGS) return;
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const hitX = W * HIT_LINE_FRAC;
@@ -992,42 +834,35 @@
             const dt = now - n.t;
             if (dt < 0 || dt >= IMPACT_DURATION) continue;
 
-            // Ease-out curve: starts fast, slows down. Good for impacts.
             const p = dt / IMPACT_DURATION;
             const ease = 1 - Math.pow(1 - p, 2);
             const y = yFor(n.s, H, nStrings);
-            const color = colors[n.s];
+            const color = colors[n.s] || FALLBACK_COLOR;
 
-            // Expanding ring: grows from noteR out to ~3.2x, alpha fades
             const baseR = 14;
-            const expansion = DISABLE_RINGS ? 0 : ease * 2.2;
-            const r = baseR * (1 + expansion);
+            const r = baseR * (1 + ease * 2.2);
             const alpha = (1 - p) * 0.85;
 
             ctx.save();
             ctx.globalAlpha = alpha;
             ctx.strokeStyle = color;
-            ctx.lineWidth = 3 - (DISABLE_RINGS ? 0 : ease * 2);  // thick → thin
+            ctx.lineWidth = 3 - ease * 2;
             ctx.shadowColor = color;
             ctx.shadowBlur = 18;
             ctx.beginPath();
             ctx.arc(hitX, y, r, 0, Math.PI * 2);
             ctx.stroke();
 
-            // Secondary inner ring in white for extra pop on fresh hits
             if (p < 0.5) {
-                const expansion2 = DISABLE_RINGS ? 0 : ease * 1.2;
                 ctx.globalAlpha = (1 - p * 2) * 0.6;
                 ctx.strokeStyle = '#ffffff';
                 ctx.shadowBlur = 10;
                 ctx.lineWidth = 2;
                 ctx.beginPath();
-                ctx.arc(hitX, y, baseR * (1 + expansion2), 0, Math.PI * 2);
+                ctx.arc(hitX, y, baseR * (1 + ease * 1.2), 0, Math.PI * 2);
                 ctx.stroke();
             }
 
-            // Horizontal string flash — a bright streak along the string
-            // for ~120ms, like plucking the string.
             if (p < 0.3) {
                 const flashAlpha = (1 - p / 0.3) * 0.7;
                 ctx.shadowBlur = 0;
@@ -1048,11 +883,7 @@
         }
     }
 
-    // Bend indicators — a bright vertical arrow above any note with bn > 0,
-    // labeled with the bend amount in standard tab notation. Rendered on
-    // top of notes (both normal fret circles and fused capsules) so it's
-    // visible regardless of which note presentation is used.
-    function drawBends(W, H, nStrings, colors, now) {
+    function drawBends(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
 
@@ -1068,7 +899,6 @@
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
 
-            // Fade with the note
             let alpha = 1;
             const dt = now - n.t;
             if (dt > 0) {
@@ -1076,10 +906,6 @@
                 if (alpha <= 0) continue;
             }
 
-            // Arrow geometry: starts at the top of the fret circle and
-            // points up; length scales slightly with bend amount (bigger
-            // bend = longer arrow) so half-bends and full bends look
-            // different at a glance.
             const noteR = 14;
             const baseY = y - noteR - 2;
             const len = 14 + Math.min(12, n.bn * 6);
@@ -1096,13 +922,11 @@
             ctx.lineWidth = 2;
             ctx.lineCap = 'round';
 
-            // Shaft
             ctx.beginPath();
             ctx.moveTo(x, baseY);
             ctx.lineTo(x, tipY + headH);
             ctx.stroke();
 
-            // Arrowhead (filled triangle)
             ctx.shadowBlur = 0;
             ctx.beginPath();
             ctx.moveTo(x, tipY);
@@ -1111,7 +935,6 @@
             ctx.closePath();
             ctx.fill();
 
-            // Label to the right of the tip
             ctx.fillStyle = '#ffd35a';
             ctx.shadowColor = '#000000';
             ctx.shadowBlur = 3;
@@ -1121,7 +944,7 @@
         }
     }
 
-    function drawNotes(W, H, nStrings, colors, now) {
+    function drawNotes(ctx, state, W, H, nStrings, colors, now) {
         if (!state.ready || !state.notes.length) return;
         const { start, end } = binaryVisibleRange(state.notes, now);
         const hitX = W * HIT_LINE_FRAC;
@@ -1136,8 +959,8 @@
 
             const x = timeX(n.t, now, W);
             const y = yFor(n.s, H, nStrings);
-            const color = colors[n.s];
-            const R = clampByNeighbors(NOTE_MAX_R, n, W);
+            const color = colors[n.s] || FALLBACK_COLOR;
+            const R = clampByNeighbors(noteRadius(x, hitX, W), n, W);
 
             let alpha = 1;
             const dt = now - n.t;
@@ -1149,7 +972,6 @@
             ctx.save();
             ctx.globalAlpha = alpha;
 
-            // Colored glow halo
             ctx.shadowColor = color;
             ctx.shadowBlur = 14;
             ctx.fillStyle = color;
@@ -1157,7 +979,6 @@
             ctx.arc(x, y, R, 0, Math.PI * 2);
             ctx.fill();
 
-            // Inner gradient for a subtle 3D feel
             ctx.shadowBlur = 0;
             const innerGrad = ctx.createRadialGradient(
                 x - R * 0.3, y - R * 0.4, R * 0.1,
@@ -1171,14 +992,12 @@
             ctx.arc(x, y, R, 0, Math.PI * 2);
             ctx.fill();
 
-            // Crisp outline
             ctx.lineWidth = 2;
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
             ctx.beginPath();
             ctx.arc(x, y, R, 0, Math.PI * 2);
             ctx.stroke();
 
-            // Fret number
             ctx.font = 'bold ' + Math.round(R * 0.95) + 'px "SF Mono", Menlo, monospace';
             ctx.fillStyle = '#0a0f1c';
             ctx.fillText(String(n.f), x, y + 1);
@@ -1186,22 +1005,14 @@
         }
     }
 
-    // ── Chord display ───────────────────────────────────────
-    function findActiveChord(chords, now) {
-        // Find the chord whose time is closest to now (most recently started)
-        let best = null;
-        for (const c of chords) {
-            if (c.t <= now && (!best || c.t > best.t)) {
-                best = c;
-            }
-        }
-        return best;
-    }
-
+    // Rounded-rect helper used by the chord-box renderer below.
+    // Module-scope so the (ctx, state, ...) draw helpers can call it
+    // without a closure dependency. Accepts a numeric radius
+    // (uniform corners) or a {tl, tr, br, bl} object.
     function roundRect(ctx, x, y, width, height, radius) {
         if (typeof radius === 'undefined') radius = 5;
-        if (typeof radius === 'number') radius = {tl: radius, tr: radius, br: radius, bl: radius};
-        const {tl, tr, br, bl} = radius;
+        if (typeof radius === 'number') radius = { tl: radius, tr: radius, br: radius, bl: radius };
+        const { tl, tr, br, bl } = radius;
         ctx.beginPath();
         ctx.moveTo(x + tl, y);
         ctx.lineTo(x + width - tr, y);
@@ -1215,178 +1026,30 @@
         ctx.closePath();
     }
 
-    function drawChordDiagram(x, y, chordName, frets, nStrings) {
-        // Draw a miniature chord diagram (6 or 4 strings)
-        const diagW = 50;
-        const diagH = 60;
-        const stringSpacing = diagW / Math.max(3, nStrings - 1);
-        const fretH = 12;
+    // ═══════════════════════════════════════════════════════════════════════
+    // Chord-box rendering (alleexx's contribution from renanboni's fork —
+    // ported into the per-instance factory shape so it renders on a
+    // separate chordCtx + chordCanvas owned by each factory instance).
+    //
+    // Reads only `state.chords` and `state.chordTemplates` (both already
+    // populated from the setRenderer bundle, slopsmith#92), plus the
+    // active `now` time and the resolved `nStrings`. No module-scope
+    // state, no own WebSocket — fits cleanly into Wave C's
+    // (ctx, state, ...) draw-helper pattern.
+    // ═══════════════════════════════════════════════════════════════════════
 
-        // Background
-        ctx.fillStyle = 'rgba(20, 30, 50, 0.95)';
-        ctx.fillRect(x - diagW / 2, y, diagW, diagH + 20);
+    function drawChordBoxes(chordCtx, chordCanvas, state, nStrings, now) {
+        if (!chordCtx || !chordCanvas) return;
+        if (!state.ready || !state.chords || !state.chords.length) return;
+        if (!state.chordTemplates || !state.chordTemplates.length) return;
 
-        // Border
-        ctx.strokeStyle = 'rgba(110, 231, 255, 0.5)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(x - diagW / 2, y, diagW, diagH + 20);
-
-        // Chord name label
-        ctx.font = 'bold 11px "SF Mono"';
-        ctx.fillStyle = '#6ee7ff';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillText(chordName, x, y + 2);
-
-        // Diagram top (nut or fret 1 indicator)
-        const diagTop = y + 18;
-
-        // Vertical string lines
-        ctx.strokeStyle = 'rgba(150, 160, 180, 0.6)';
-        ctx.lineWidth = 1;
-        for (let s = 0; s < nStrings; s++) {
-            const sx = x - diagW / 2 + 5 + (s * stringSpacing);
-            ctx.beginPath();
-            ctx.moveTo(sx, diagTop);
-            ctx.lineTo(sx, diagTop + 48);
-            ctx.stroke();
-        }
-
-        // Horizontal fret lines
-        ctx.strokeStyle = 'rgba(100, 110, 130, 0.4)';
-        ctx.lineWidth = 1;
-        for (let f = 0; f < 5; f++) {
-            const fy = diagTop + f * fretH;
-            ctx.beginPath();
-            ctx.moveTo(x - diagW / 2 + 5, fy);
-            ctx.lineTo(x - diagW / 2 + 5 + diagW - 10, fy);
-            ctx.stroke();
-        }
-
-        // Finger positions (dots on diagram)
-        if (frets && frets.length) {
-            ctx.fillStyle = 'rgba(107, 255, 149, 0.8)';
-            for (let s = 0; s < Math.min(nStrings, frets.length); s++) {
-                const fret = frets[s];
-                if (fret && fret > 0) {
-                    const sx = x - diagW / 2 + 5 + (s * stringSpacing);
-                    const fy = diagTop + fret * fretH - fretH / 2;
-                    ctx.beginPath();
-                    ctx.arc(sx, fy, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                    // Fret number inside dot
-                    ctx.font = 'bold 7px monospace';
-                    ctx.fillStyle = '#0a0f1c';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillText(String(fret), sx, fy);
-                }
-            }
-            // X marks for muted strings
-            ctx.strokeStyle = 'rgba(255, 107, 139, 0.7)';
-            ctx.lineWidth = 1.5;
-            for (let s = 0; s < Math.min(nStrings, frets.length); s++) {
-                const fret = frets[s];
-                if (fret === 0 || fret === '0' || fret === null) {
-                    // Muted or open string might show as 0 or null
-                }
-            }
-        }
-    }
-
-    function drawChordDiagramBox(x, y, width, height, frets, fingers, nStrings) {
-        const stringCount = Math.min(nStrings, Math.max(4, frets.length));
-        const diagWidth = 140;
-        const diagHeight = 170;
-        const diagX = x + (width - diagWidth) / 2;
-        const diagY = y + 80;
-
-        const stringSpacing = diagWidth / Math.max(1, stringCount - 1);
-        const fretSpacing = diagHeight / 5;
-        const nutY = diagY;
-
-        chordCtx.strokeStyle = 'rgba(200, 220, 255, 0.6)';
-        chordCtx.lineWidth = 2.5;
-        for (let i = 0; i < stringCount; i++) {
-            const sx = diagX + i * stringSpacing;
-            chordCtx.beginPath();
-            chordCtx.moveTo(sx, nutY);
-            chordCtx.lineTo(sx, nutY + diagHeight);
-            chordCtx.stroke();
-        }
-
-        chordCtx.strokeStyle = 'rgba(180, 200, 240, 0.35)';
-        chordCtx.lineWidth = 1.5;
-        for (let f = 0; f <= 5; f++) {
-            const fy = nutY + f * fretSpacing;
-            chordCtx.beginPath();
-            chordCtx.moveTo(diagX, fy);
-            chordCtx.lineTo(diagX + diagWidth, fy);
-            chordCtx.stroke();
-        }
-
-        chordCtx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
-        chordCtx.lineWidth = 4;
-        chordCtx.beginPath();
-        chordCtx.moveTo(diagX, nutY);
-        chordCtx.lineTo(diagX + diagWidth, nutY);
-        chordCtx.stroke();
-
-        chordCtx.textAlign = 'center';
-        chordCtx.textBaseline = 'middle';
-
-        for (let i = 0; i < stringCount; i++) {
-            const sx = diagX + i * stringSpacing;
-            const fret = frets[i];
-            const finger = fingers[i];
-            const topY = nutY - 6;
-
-            if (fret === 0) {
-                chordCtx.fillStyle = '#ffffff';
-                chordCtx.font = 'bold 18px "SF Mono", monospace';
-                chordCtx.fillText('○', sx, topY);
-            } else if (fret === -1 || fret === null || fret === undefined) {
-                chordCtx.fillStyle = '#ff6b8b';
-                chordCtx.font = 'bold 24px "SF Mono", monospace';
-                chordCtx.fillText('×', sx, topY);
-            }
-
-            if (typeof fret === 'number' && fret > 0 && fret <= 5) {
-                const fretY = nutY + fret * fretSpacing - fretSpacing / 2;
-                chordCtx.fillStyle = 'rgba(110, 231, 255, 0.95)';
-                chordCtx.beginPath();
-                chordCtx.arc(sx, fretY, 12, 0, Math.PI * 2);
-                chordCtx.fill();
-                chordCtx.fillStyle = '#08101c';
-                chordCtx.font = 'bold 14px monospace';
-                chordCtx.fillText(String(fret), sx, fretY);
-            }
-        }
-
-        for (let i = 0; i < stringCount; i++) {
-            const sx = diagX + i * stringSpacing;
-            const finger = fingers[i];
-            if (typeof finger === 'number' && finger >= 0) {
-                chordCtx.fillStyle = 'rgba(255, 255, 255, 0.85)';
-                chordCtx.font = '600 13px "SF Mono", monospace';
-                chordCtx.fillText(String(finger), sx, nutY + diagHeight + 22);
-            }
-        }
-
-        const lowestFret = Math.min(...frets.filter((f) => typeof f === 'number' && f > 0));
-        if (isFinite(lowestFret) && lowestFret > 1) {
-            chordCtx.font = '500 12px "SF Mono", monospace';
-            chordCtx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-            chordCtx.textAlign = 'left';
-            chordCtx.fillText(`${lowestFret}fr`, diagX - 32, nutY + fretSpacing * 2.5);
-        }
-    }
-
-    function drawChordBoxes(now) {
-        if (!chordCtx || !state.ready || !state.chords.length || !state.chordTemplates.length) return;
         const W = chordCanvas.clientWidth;
         const H = chordCanvas.clientHeight;
+        if (W === 0 || H === 0) return;
 
+        // Clear and paint the chord canvas's background. The chord
+        // canvas is independent of the note canvas — its own clear
+        // matters even though the note canvas does its own.
         chordCtx.clearRect(0, 0, chordCanvas.width, chordCanvas.height);
         chordCtx.fillStyle = 'rgba(6, 10, 18, 0.96)';
         chordCtx.fillRect(0, 0, W, H);
@@ -1394,6 +1057,10 @@
         const hitX = W * HIT_LINE_FRAC;
         const tMin = now - BEHIND;
         const tMax = now + AHEAD;
+
+        // Visible chord events in [tMin, tMax]. state.chords is sorted
+        // by t (slopsmith core guarantees) so an early break is safe
+        // once we pass tMax.
         const visible = [];
         for (const ch of state.chords) {
             if (ch.t < tMin) continue;
@@ -1402,23 +1069,29 @@
         }
         if (!visible.length) return;
 
-        // Deduplicate consecutive chords with the same name
+        // Deduplicate consecutive chords with the same name — when a
+        // single chord shape is held across multiple chord events
+        // (rhythm playing the same shape on each downbeat), we don't
+        // want a wall of identical boxes.
         const unique = [];
         let lastChordName = null;
         for (const ch of visible) {
             const template = state.chordTemplates[ch.id];
-            const chordName = template?.name || `Chord ${ch.id}`;
+            const chordName = (template && template.name) || `Chord ${ch.id}`;
             if (chordName !== lastChordName) {
                 unique.push(ch);
                 lastChordName = chordName;
             }
         }
+        if (!unique.length) return;
 
-        const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
         const diagWidth = 140;
         const diagHeight = 140;
         const boxPadding = 24;
 
+        // The active chord is the most recent one whose t <= now.
+        // Pinned to the hit line; other chords float at their own
+        // timeX position.
         let activeIndex = -1;
         for (let i = 0; i < unique.length; i++) {
             if (unique[i].t <= now) activeIndex = i;
@@ -1440,13 +1113,15 @@
             const frets = template.frets || [];
             const fingers = template.fingers || [];
 
-            // Calculate the minimum fret for positioning
             const playedFrets = frets.filter(f => typeof f === 'number' && f > 0);
             const minFret = playedFrets.length > 0 ? Math.min(...playedFrets) : 1;
             const maxFret = playedFrets.length > 0 ? Math.max(...playedFrets) : 1;
 
-            // Ignore chord diagrams with names starting with "Chord " and those with only empty nodes
-            if (chordName.startsWith('Chord ') || frets.every(f => f === 0 || f === -1 || f === null || f === undefined)) {
+            // Skip "Chord N" placeholder names and templates whose
+            // frets are all empty / muted — they're not useful as
+            // chord-shape diagrams.
+            if (chordName.startsWith('Chord ') ||
+                frets.every(f => f === 0 || f === -1 || f === null || f === undefined)) {
                 return;
             }
 
@@ -1456,11 +1131,13 @@
             const boxTop = 12;
 
             const dt = now - ch.t;
-            const fadeOutAfter = 0.22; // seconds after hit line before disappearing
+            const fadeOutAfter = 0.22;  // seconds after hit line before disappearing
             if (!isCurrent && (dt >= fadeOutAfter || boxLeft <= 0)) {
                 return;
             }
 
+            // Approach factor 0..1 — used to fade non-active boxes
+            // up as they near the hit line and out as they pass.
             const approach = dt < 0
                 ? 1 - Math.min(-dt, AHEAD) / AHEAD
                 : Math.max(0, 1 - Math.min(dt, BEHIND) / BEHIND);
@@ -1514,6 +1191,7 @@
                 chordCtx.stroke();
             }
 
+            // Nut line (top of the diagram)
             chordCtx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
             chordCtx.lineWidth = 3;
             chordCtx.beginPath();
@@ -1565,120 +1243,118 @@
             chordCtx.restore();
         };
 
+        // Render non-active boxes first (back-to-front so the active
+        // pinned box is always on top).
         for (const ch of otherChords) {
             renderChordBox(ch, false);
         }
         renderChordBox(activeChord, true);
     }
 
-    function drawNoteFrame(now) {
-        if (!ctx || !noteCanvas) return;
-        const W = noteCanvas.clientWidth || noteCanvas.getBoundingClientRect().width;
-        const H = noteCanvas.clientHeight || noteCanvas.getBoundingClientRect().height;
+    function drawFrame(ctx, state, canvas, now) {
+        if (!ctx || !canvas) return;
+        const W = canvas.clientWidth;
+        const H = canvas.clientHeight;
         if (W === 0 || H === 0) return;
-        const nStrings = (state.tuning && state.tuning.length === 4) ? 4 : 6;
+        // Resolve active string count. Prefer state.stringCount
+        // (populated from bundle.stringCount, slopsmith#93) which
+        // is the reliable signal computed server-side. Fall back to
+        // tuning length (works for older sloppaks where tuning
+        // arrays have already been truncated by lib/song.py); fall
+        // back to 6 (the canonical guitar count).
+        //
+        // The previous heuristic `state.tuning.length === 4 ? 4 : 6`
+        // was broken for RS-XML-sourced bass — RS XML always emits
+        // length 6 regardless of instrument, so bass got rendered as
+        // 6 strings with the upper 2 empty. The new server-side
+        // signal handles all sources uniformly.
+        const nStrings = (typeof state.stringCount === 'number' && state.stringCount > 0)
+            ? state.stringCount
+            : (state.tuning && state.tuning.length > 0 ? state.tuning.length : 6);
         const colors = colorsFor(nStrings);
 
-        drawBackground(W, H, nStrings, colors, now);
-        drawSustains(W, H, nStrings, colors, now);
-        // drawArcs (dashed trajectory curves) intentionally omitted — the
-        // ball still hops along the underlying state.arcs data, we just
-        // don't visualize the path.
-        drawTechniquePairs(W, H, nStrings, colors, now);
-        drawTechniqueArcs(W, H, nStrings, colors, now);
-        drawNotes(W, H, nStrings, colors, now);
-        drawBends(W, H, nStrings, colors, now);
-        drawImpacts(W, H, nStrings, colors, now);
-        drawBall(W, H, nStrings, colors, now);
-        drawEdgeFade(W, H);
-        drawStringLabels(W, H, nStrings, colors);
-        drawHeader(W, H, now);
-        drawProgress(W, H, now);
+        drawBackground(ctx, state, W, H, nStrings, colors, now);
+        drawSustains(ctx, state, W, H, nStrings, colors, now);
+        // drawArcs (dashed trajectory curves) intentionally omitted —
+        // the ball still hops along state.arcs; we just don't
+        // visualize the path.
+        drawTechniquePairs(ctx, state, W, H, nStrings, colors, now);
+        drawTechniqueArcs(ctx, state, W, H, nStrings, colors, now);
+        drawNotes(ctx, state, W, H, nStrings, colors, now);
+        drawBends(ctx, state, W, H, nStrings, colors, now);
+        drawImpacts(ctx, state, W, H, nStrings, colors, now);
+        drawBall(ctx, state, W, H, nStrings, colors, now);
+        drawEdgeFade(ctx, W, H);
+        drawHeader(ctx, state, W, H, now);
+        drawProgress(ctx, state, W, H, now);
     }
 
-    function drawChordFrame(now) {
-        if (!chordCanvas || !chordCtx) return;
-        drawChordBoxes(now);
-    }
+    // ── Pure-helper exports for the test harness ────────────────────
+    //
+    // Surface is intentionally broad. These are all stateless and the
+    // test harness can exercise any subset; keeping the export aligned
+    // with the full pure-helper layer (rather than a hand-picked few)
+    // means a new test that wants e.g. clampByNeighbors or
+    // findActiveArc doesn't require a plugin-side patch.
+    window.__jumpingtab_core = {
+        stringY, yFor, colorsFor, timeX,
+        binaryVisibleRange, buildTrajectories, buildTechniqueArcs,
+        bezierPoint, noteRadius, secondsToPx, clampByNeighbors,
+        arcControlPoint, findActiveArc, nearestNoteAtHit,
+        currentSection, bendText,
+        AHEAD, BEHIND, HIT_LINE_FRAC, FADE_SECONDS, IMPACT_DURATION,
+        SQUASH_WINDOW_MS, NOTE_BASE_R, NOTE_MAX_R, MIN_NOTE_R,
+    };
 
-    function tick() {
-        if (!active) return;
-        const now = audioEl ? audioEl.currentTime : 0;
-        drawNoteFrame(now);
-        drawChordFrame(now);
-        raf = requestAnimationFrame(tick);
-    }
+    // ── Demo / test-harness scaffolding ─────────────────────────────
+    //
+    // The standalone demo/ HTML binds a canvas, sets synthetic state,
+    // and calls drawFrame directly to generate README screenshots
+    // without running slopsmith. Wave C keeps this exact API working
+    // by giving the demo its own module-scope state + canvas / ctx
+    // refs — separate from any factory instance — so demo invocations
+    // never clobber per-instance state.
 
-    // ── Toggle + button ──────────────────────────────────────
-    function toggle() {
-        if (!active) {
-            if (!state.ready) {
-                console.warn('[jumpingtab] not ready — song data still loading');
-                return;
-            }
-            if (!mountCanvas()) return;
-            active = true;
-            if (raf) cancelAnimationFrame(raf);
-            tick();
-            const b = document.getElementById('btn-jt');
-            if (b) b.className = 'px-3 py-1.5 bg-cyan-900/50 rounded-lg text-xs text-cyan-300 transition';
-        } else {
-            active = false;
-            if (raf) { cancelAnimationFrame(raf); raf = null; }
-            unmountCanvas();
-            const b = document.getElementById('btn-jt');
-            if (b) b.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-        }
-    }
+    const _demoState = _newState();
+    let _demoCanvas = null;
+    let _demoCtx = null;
 
-    function injectBtn() {
-        const c = document.getElementById('player-controls');
-        if (!c || document.getElementById('btn-jt')) return;
-        const last = c.querySelector('button:last-child');
-        const b = document.createElement('button');
-        b.id = 'btn-jt';
-        b.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-        b.textContent = 'Jumping Tab';
-        b.title = 'Toggle Yousician-style jumping tab view';
-        b.disabled = true;
-        b.style.opacity = '0.5';
-        b.onclick = toggle;
-        c.insertBefore(b, last);
-    }
-
-    // Expose for manual poking / future tests
-    window.__jumpingtab_state = state;
-    window.__jumpingtab_connect = connect;
-
-    // Debug / demo-harness hook. Lets a standalone HTML page bind a
-    // canvas, set synthetic state, and invoke drawFrame directly —
-    // used by demo/ to generate screenshots without running slopsmith.
+    window.__jumpingtab_state = _demoState;
     window.__jumpingtab_demo = {
         setCanvas(cnv) {
-            noteCanvas = cnv;
-            chordCanvas = null;
-            noteCtx = cnv.getContext('2d');
-            ctx = noteCtx;
-            const dpr = (window.devicePixelRatio || 1) * 1.35;
+            // getContext('2d') can return null when the browser has
+            // locked this canvas to a different context type or 2D
+            // is disabled for the origin. Mirror mountCanvas's
+            // production guard: warn + bail rather than throwing on
+            // the .setTransform below, which would leave the demo
+            // harness in a half-initialised state (canvas captured
+            // but no usable ctx) and break test.html silently.
+            const ctx2d = cnv.getContext('2d');
+            if (!ctx2d) {
+                console.warn('[jumpingtab] demo.setCanvas: getContext("2d") returned null; aborting');
+                return false;
+            }
+            _demoCanvas = cnv;
+            _demoCtx = ctx2d;
+            const dpr = window.devicePixelRatio || 1;
             const rect = cnv.getBoundingClientRect();
             cnv.width = Math.max(1, Math.floor(rect.width * dpr));
             cnv.height = Math.max(1, Math.floor(rect.height * dpr));
-            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            _demoCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            return true;
         },
-        setState(patch) { Object.assign(state, patch); },
-        // Mirror the work that connect()'s finalize step does on real data
-        // so demo states can be flat note arrays without precomputing.
+        setState(patch) { Object.assign(_demoState, patch); },
         finalizeState() {
-            state.notes.sort((a, b) => a.t - b.t);
+            _demoState.notes.sort((a, b) => a.t - b.t);
             const lastIdxByString = new Map();
             const EPS_T = 1e-4;
-            for (let i = 0; i < state.notes.length; i++) {
-                const n = state.notes[i];
+            for (let i = 0; i < _demoState.notes.length; i++) {
+                const n = _demoState.notes[i];
                 n._gapL = Infinity;
                 n._gapR = Infinity;
                 const prevIdx = lastIdxByString.get(n.s);
                 if (prevIdx != null) {
-                    const prev = state.notes[prevIdx];
+                    const prev = _demoState.notes[prevIdx];
                     const gap = n.t - prev.t;
                     if (gap > EPS_T) {
                         n._gapL = gap;
@@ -1687,226 +1363,352 @@
                 }
                 lastIdxByString.set(n.s, i);
             }
-            state.arcs = buildTrajectories(state.notes);
-            const tech = buildTechniqueArcs(state.notes);
-            state.techArcs = tech.arcs;
-            state.techPaired = tech.paired;
-            state.ready = true;
+            _demoState.arcs = buildTrajectories(_demoState.notes);
+            const tech = buildTechniqueArcs(_demoState.notes);
+            _demoState.techArcs = tech.arcs;
+            _demoState.techPaired = tech.paired;
+            _demoState.ready = true;
         },
-        drawFrame: drawNoteFrame,
-        drawNoteFrame,
-        drawChordFrame,
+        drawFrame(now) {
+            drawFrame(_demoCtx, _demoState, _demoCanvas, now);
+        },
     };
 
-    // ── Hook installation ────────────────────────────────────
-    const _origPlay = window.playSong;
-    window.playSong = async function (filename, arrangement) {
-        // Tear down any currently-active view before switching songs
-        if (active) {
-            active = false;
-            if (raf) { cancelAnimationFrame(raf); raf = null; }
-            unmountCanvas();
-            const b = document.getElementById('btn-jt');
-            if (b) b.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-        }
+    // ── Per-instance counter for DOM tagging ────────────────────────
+    let _nextInstanceId = 0;
 
-        await _origPlay(filename, arrangement);
-        injectBtn();
-        const btn = document.getElementById('btn-jt');
-        if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; btn.title = 'Loading…'; }
+    // ═══════════════════════════════════════════════════════════════════════
+    // Factory — slopsmith#36 setRenderer contract (multi-instance)
+    // ═══════════════════════════════════════════════════════════════════════
 
-        try {
-            await connect(filename, arrangement);
-            console.log('[jumpingtab] loaded',
-                state.notes.length, 'notes,', state.arcs.length, 'arcs');
-            if (btn) { btn.disabled = false; btn.style.opacity = ''; btn.title = 'Toggle Yousician-style jumping tab view'; }
-        } catch (e) {
-            console.warn('[jumpingtab] connect failed:', e.message);
-            if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; btn.title = 'Jumping Tab unavailable: ' + e.message; }
-        }
-    };
+    function createFactory() {
+        const _instanceId = ++_nextInstanceId;
 
-    const _origShow = window.showScreen;
-    window.showScreen = function (id) {
-        if (id !== 'player') {
-            if (active) {
-                active = false;
-                unmountCanvas();
-            }
-            if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
-        }
-        if (typeof _origShow === 'function') _origShow(id);
-    };
+        // Lifecycle
+        let _isReady = false;
 
-    // Wrap changeArrangement so switching Lead / Rhythm / Bass in the
-    // player dropdown re-runs our connect() with the new arrangement
-    // index. The ws builds a fresh note/arc/beat set for the new
-    // arrangement; if the tab view is currently active, we redraw from
-    // whatever the new state is.
-    const _origChangeArr = window.changeArrangement;
-    window.changeArrangement = function (index) {
-        if (typeof _origChangeArr === 'function') _origChangeArr(index);
-        if (!state.filename) return;
-        const btn = document.getElementById('btn-jt');
-        if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; btn.title = 'Loading…'; }
-        connect(state.filename, parseInt(index, 10))
-            .then(() => {
-                if (btn) { btn.disabled = false; btn.style.opacity = ''; btn.title = 'Toggle Yousician-style jumping tab view'; }
-            })
-            .catch((e) => {
-                console.warn('[jumpingtab] arrangement switch failed:', e.message);
-                if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; btn.title = 'Jumping Tab unavailable: ' + e.message; }
-            });
-    };
+        // Per-instance chart cache. Each panel under splitscreen
+        // builds its own — even when N panels render the same song,
+        // a panel's filtered notes (master-difficulty per panel) and
+        // arrangement choice can differ, and trajectory arcs must
+        // mirror what's actually visible.
+        const state = _newState();
 
-    // ── Context-swap helpers for multi-instance rendering ───
-    function _swapRenderTarget(newCanvas, newCtx, newState) {
-        const saved = { noteCanvas, noteCtx, ctx, stateSnap: { ...state } };
-        noteCanvas = newCanvas;
-        noteCtx = newCtx;
-        ctx = newCtx;
-        Object.assign(state, newState);
-        return saved;
-    }
-    function _restoreRenderTarget(saved) {
-        noteCanvas = saved.noteCanvas;
-        noteCtx = saved.noteCtx;
-        ctx = saved.ctx;
-        Object.assign(state, saved.stateSnap);
-    }
+        // Reference-identity sentinels for cache invalidation. Core
+        // creates a new array whenever the filtered chart rebuilds
+        // (new song, arrangement change, master-difficulty flip
+        // changing _filteredNotes), so reference-compare is a cheap,
+        // reliable signal that we must rebuild trajectories + gaps.
+        let _lastNotesRef = null;
+        let _lastChordsRef = null;
 
-    // ── Factory for splitscreen panes ────────────────────────
-    window.createJumpingTabPane = function ({ container }) {
-        const localCanvas = document.createElement('canvas');
-        localCanvas.style.cssText = 'width:100%;height:100%;display:block;background:#0f1420;';
-        container.appendChild(localCanvas);
-        const localCtx = localCanvas.getContext('2d');
+        // Rendering / DOM state — one set per panel.
+        let canvas = null;
+        let wrap = null;
+        let ctx = null;
+        // Secondary canvas for chord-box rendering (alleexx's
+        // contribution from renanboni's fork). Lives in the same
+        // wrap as the note canvas with flex layout — chord canvas
+        // takes the top ~35% of the wrap, note canvas the bottom
+        // ~65%. Both per-instance so N splitscreen panels each
+        // have their own chord-box surface.
+        let chordCanvas = null;
+        let chordCtx = null;
+        let highwayCanvas = null;
+        let prevHighwayDisplay = '';
 
-        const localState = {
-            filename: null, tuning: null, notes: [], arcs: [],
-            techArcs: [], techPaired: new Set(), beats: [],
-            sections: [], chords: [], chordTemplates: [],
-            songInfo: {}, ready: false, ws: null,
-        };
-        let localRaf = null;
-        let destroyed = false;
+        // ── Listener ref (per-instance so detach matches attach) ──
+        const _onWinResize = () => sizeCanvasToBox();
 
-        function sizeLocal() {
-            if (!localCanvas || !localCtx) return;
-            const rect = localCanvas.getBoundingClientRect();
+        function sizeCanvasToBox() {
+            if (!canvas || !ctx) return;
             const dpr = window.devicePixelRatio || 1;
+
+            const rect = canvas.getBoundingClientRect();
             const pxW = Math.max(1, Math.floor(rect.width * dpr));
             const pxH = Math.max(1, Math.floor(rect.height * dpr));
-            if (localCanvas.width !== pxW || localCanvas.height !== pxH) {
-                localCanvas.width = pxW;
-                localCanvas.height = pxH;
+            if (canvas.width !== pxW || canvas.height !== pxH) {
+                canvas.width = pxW;
+                canvas.height = pxH;
             }
-            localCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+            // Chord canvas may not exist (mountCanvas could fail
+            // to allocate it on tight DOM), or its context could
+            // have been refused. The note canvas handles the bulk
+            // of the rendering on its own; chord boxes are an
+            // additive feature.
+            if (chordCanvas && chordCtx) {
+                const cRect = chordCanvas.getBoundingClientRect();
+                const cPxW = Math.max(1, Math.floor(cRect.width * dpr));
+                const cPxH = Math.max(1, Math.floor(cRect.height * dpr));
+                if (chordCanvas.width !== cPxW || chordCanvas.height !== cPxH) {
+                    chordCanvas.width = cPxW;
+                    chordCanvas.height = cPxH;
+                }
+                chordCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            }
         }
 
-        function localTick() {
-            if (destroyed) return;
-            const audioEl = document.getElementById('audio');
-            const now = audioEl ? audioEl.currentTime : 0;
-            sizeLocal();
-            const saved = _swapRenderTarget(localCanvas, localCtx, localState);
-            drawNoteFrame(now);
-            _restoreRenderTarget(saved);
-            localRaf = requestAnimationFrame(localTick);
+        function mountCanvas(providedHighwayCanvas) {
+            // We anchor our wrap via
+            // providedHighwayCanvas.insertAdjacentElement('afterend', ...),
+            // so the only DOM dependency is a canvas with a connected
+            // parent. The prior `#player` lookup was never actually used
+            // below and made init() fail in environments where the
+            // enclosing container has a different id (splitscreen panels,
+            // tests, hosts that rename the shell).
+            if (!providedHighwayCanvas || !providedHighwayCanvas.parentNode) return false;
+
+            wrap = document.createElement('div');
+            // Per-instance id so N splitscreen panels don't collide
+            // on getElementById lookups. Class kept alongside for any
+            // plugin-wide CSS that might want to target every wrap.
+            wrap.id = 'jumpingtab-wrap-' + _instanceId;
+            wrap.className = 'jumpingtab-wrap';
+            wrap.dataset.jumpingtabInstance = String(_instanceId);
+            // Vertical flex column: chord canvas on top (~35%),
+            // note canvas below (~65%). Layout matches renanboni's
+            // fork where alleexx's chord boxes were originally
+            // introduced.
+            wrap.style.cssText = [
+                'flex:1',
+                'min-height:0',
+                'display:flex',
+                'flex-direction:column',
+                'align-items:stretch',
+                'justify-content:center',
+                'gap:6px',
+                'padding:0 24px',
+            ].join(';');
+
+            // Chord canvas — top of the wrap, holds chord-box
+            // diagrams scrolling left as time progresses. Created
+            // BEFORE the note canvas so DOM order matches visual
+            // order for accessibility / devtools.
+            chordCanvas = document.createElement('canvas');
+            chordCanvas.id = 'jumpingtab-chord-canvas-' + _instanceId;
+            chordCanvas.className = 'jumpingtab-chord-canvas';
+            chordCanvas.dataset.jumpingtabInstance = String(_instanceId);
+            chordCanvas.style.cssText = [
+                'width:100%',
+                'flex:0.35',
+                'min-height:0',
+                'display:block',
+                'background:#090f18',
+                'border-radius:10px',
+                'box-shadow:0 8px 24px rgba(0,0,0,0.3)',
+            ].join(';');
+
+            canvas = document.createElement('canvas');
+            canvas.id = 'jumpingtab-canvas-' + _instanceId;
+            canvas.className = 'jumpingtab-canvas';
+            canvas.dataset.jumpingtabInstance = String(_instanceId);
+            canvas.style.cssText = [
+                'width:100%',
+                'flex:0.65',
+                'min-height:0',
+                'display:block',
+                'background:#0f1420',
+                'border-radius:10px',
+                'box-shadow:0 8px 24px rgba(0,0,0,0.4)',
+            ].join(';');
+
+            wrap.appendChild(chordCanvas);
+            wrap.appendChild(canvas);
+            providedHighwayCanvas.insertAdjacentElement('afterend', wrap);
+            ctx = canvas.getContext('2d');
+            if (!ctx) {
+                // getContext('2d') can return null when the browser has
+                // locked this canvas element to a different context type,
+                // or when 2D support is disabled for the origin. Without
+                // this guard init() would hide the highway canvas and
+                // flip _isReady=true, then drawFrame would no-op against
+                // the null ctx every rAF — leaving the player blank with
+                // no recovery until the user picked a different viz. Tear
+                // the overlay down, leave the highway visible as a
+                // fallback, and signal failure up to init().
+                console.warn('[jumpingtab] mountCanvas: note getContext("2d") returned null; aborting');
+                wrap.remove();
+                wrap = null;
+                canvas = null;
+                chordCanvas = null;
+                return false;
+            }
+            // The chord ctx is best-effort. If it fails we still want
+            // the note canvas working — chord boxes are additive.
+            chordCtx = chordCanvas.getContext('2d');
+            if (!chordCtx) {
+                console.warn('[jumpingtab] mountCanvas: chord getContext("2d") returned null; chord boxes disabled for this lifetime');
+                chordCanvas.remove();
+                chordCanvas = null;
+            }
+
+            highwayCanvas = providedHighwayCanvas;
+            prevHighwayDisplay = providedHighwayCanvas.style.display;
+            providedHighwayCanvas.style.display = 'none';
+            sizeCanvasToBox();
+            return true;
         }
 
-        function localConnect(filename, arrangementIdx) {
-            return new Promise((resolve, reject) => {
-                if (localState.ws) { try { localState.ws.close(); } catch (_) {} localState.ws = null; }
-                localState.filename = filename;
-                localState.tuning = null;
-                localState.notes = [];
-                localState.arcs = [];
-                localState.techArcs = [];
-                localState.techPaired = new Set();
-                localState.beats = [];
-                localState.sections = [];
-                localState.songInfo = {};
-                localState.ready = false;
-
-                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const qs = (arrangementIdx != null && arrangementIdx >= 0)
-                    ? `?arrangement=${arrangementIdx}` : '';
-                const url = `${proto}//${location.host}/ws/highway/${encodeURIComponent(filename)}${qs}`;
-                const ws = new WebSocket(url);
-                localState.ws = ws;
-
-                const finalize = () => {
-                    if (localState.ready) return;
-                    localState.notes.sort((a, b) => a.t - b.t);
-                    const lastIdxByString = new Map();
-                    const EPS_T = 1e-4;
-                    for (let i = 0; i < localState.notes.length; i++) {
-                        const n = localState.notes[i];
-                        n._gapL = Infinity;
-                        n._gapR = Infinity;
-                        const prevIdx = lastIdxByString.get(n.s);
-                        if (prevIdx != null) {
-                            const prev = localState.notes[prevIdx];
-                            const gap = n.t - prev.t;
-                            if (gap > EPS_T) {
-                                n._gapL = gap;
-                                if (gap < prev._gapR) prev._gapR = gap;
-                            }
-                        }
-                        lastIdxByString.set(n.s, i);
-                    }
-                    localState.arcs = buildTrajectories(localState.notes);
-                    const tech = buildTechniqueArcs(localState.notes);
-                    localState.techArcs = tech.arcs;
-                    localState.techPaired = tech.paired;
-                    localState.ready = true;
-                    if (!destroyed) { sizeLocal(); localTick(); }
-                    resolve(localState);
-                };
-
-                ws.onmessage = (ev) => {
-                    if (localState.ws !== ws) return;
-                    let msg;
-                    try { msg = JSON.parse(ev.data); } catch (_) { return; }
-                    if (msg.error) { reject(new Error(msg.error)); ws.close(); return; }
-                    if (msg.type === 'song_info') {
-                        localState.tuning = msg.tuning || [0,0,0,0,0,0];
-                        localState.songInfo = { title: msg.title || '', artist: msg.artist || '', arrangement: msg.arrangement || '', duration: msg.duration || 0 };
-                    } else if (msg.type === 'sections') {
-                        localState.sections = msg.data || [];
-                    } else if (msg.type === 'notes') {
-                        for (const n of msg.data) localState.notes.push(n);
-                    } else if (msg.type === 'chords') {
-                        for (const c of msg.data) {
-                            for (const cn of c.notes) {
-                                localState.notes.push({ t: c.t, s: cn.s, f: cn.f, sus: cn.sus || 0, ho: cn.ho || 0, po: cn.po || 0, sl: cn.sl || -1, bn: cn.bn || 0 });
-                            }
-                        }
-                    } else if (msg.type === 'beats') {
-                        localState.beats = msg.data || [];
-                    } else if (msg.type === 'ready') {
-                        finalize();
-                    }
-                };
-                ws.onerror = () => { if (localState.ws === ws && !localState.ready) reject(new Error('ws error')); };
-                ws.onclose = () => { if (localState.ws === ws && !localState.ready) reject(new Error('ws closed before ready')); };
-            });
+        function unmountCanvas() {
+            if (wrap) {
+                wrap.remove();
+                wrap = null;
+                canvas = null;
+                ctx = null;
+                chordCanvas = null;
+                chordCtx = null;
+            }
+            if (highwayCanvas) {
+                highwayCanvas.style.display = prevHighwayDisplay;
+                highwayCanvas = null;
+                prevHighwayDisplay = '';
+            }
         }
 
-        sizeLocal();
+        function _teardown() {
+            unmountCanvas();
+            _clearChart(state);
+            _lastNotesRef = null;
+            _lastChordsRef = null;
+        }
 
         return {
-            connect: localConnect,
-            destroy() {
-                destroyed = true;
-                if (localRaf) { cancelAnimationFrame(localRaf); localRaf = null; }
-                if (localState.ws) { try { localState.ws.close(); } catch (_) {} localState.ws = null; }
-                if (localCanvas.parentNode) localCanvas.remove();
+            init(providedCanvas /* , bundle */) {
+                // Defensive teardown mirrors destroy() exactly —
+                // including the highway canvas restore. If we skipped
+                // the window.resize listener removal, a double init()
+                // would leak a second listener; every resize would
+                // fire sizeCanvasToBox twice. And if we skipped the
+                // highway canvas restore, a later init() against a
+                // different canvas (or the same element after a
+                // teardown/remount cycle) would leave the previous
+                // highwayCanvas display:none forever.
+                if (wrap || _isReady) {
+                    window.removeEventListener('resize', _onWinResize);
+                    _teardown();
+                    _isReady = false;
+                } else {
+                    _clearChart(state);
+                    _lastNotesRef = null;
+                    _lastChordsRef = null;
+                }
+                if (!mountCanvas(providedCanvas)) {
+                    console.warn('[jumpingtab] init: failed to mount overlay canvas');
+                    return;
+                }
+                window.addEventListener('resize', _onWinResize);
+                _isReady = true;
             },
-            resize: sizeLocal,
-        };
-    };
+            draw(bundle) {
+                if (!_isReady || !ctx || !canvas || !bundle) return;
 
-    console.log('[jumpingtab] plugin loaded');
+                // Pick up metadata cheaply each frame. Mutate the
+                // existing state.songInfo object instead of
+                // allocating a fresh one every frame — at 60fps
+                // that's 60 short-lived metadata objects per second
+                // of GC churn. Draw code only reads the four named
+                // fields below; nothing holds a reference to a
+                // specific per-frame snapshot.
+                const info = bundle.songInfo || {};
+                const si = state.songInfo || (state.songInfo = {});
+                si.title = info.title || '';
+                si.artist = info.artist || '';
+                si.arrangement = info.arrangement || '';
+                si.duration = info.duration || 0;
+                // Always overwrite tuning, even when info.tuning is
+                // missing. Without this reset, a bass song's 4-string
+                // tuning from the previous arrangement would linger
+                // into a guitar arrangement whose bundle omitted the
+                // field, and drawFrame's nStrings check would still
+                // return 4. null is harmless — nStrings falls back
+                // to the guitar (6) default.
+                state.tuning = Array.isArray(info.tuning) ? info.tuning : null;
+                // Active string count from slopsmith core
+                // (slopsmith#93). Always overwrite — nullish during
+                // a between-songs window forces drawFrame to fall
+                // back to tuning length / 6 instead of carrying a
+                // previous song's stale value.
+                state.stringCount = (typeof bundle.stringCount === 'number' &&
+                                     bundle.stringCount > 0)
+                    ? bundle.stringCount
+                    : null;
+
+                // Beats / sections track bundle references (same
+                // identity-swap semantics as notes / chords). Always
+                // overwrite rather than conditionally assign so a
+                // bundle that omits or nulls either field during a
+                // song-change loading window can't leave the PREVIOUS
+                // song's timing grid visible in the background —
+                // drawBackground would happily render last song's
+                // measure lines / section bands against the new
+                // song's notes otherwise.
+                state.beats = Array.isArray(bundle.beats) ? bundle.beats : [];
+                state.sections = Array.isArray(bundle.sections) ? bundle.sections : [];
+                // Chord events + templates for the chord-box
+                // renderer. The note-tab renderer doesn't need
+                // these — _rebuildChart flattens chord notes into
+                // state.notes — but drawChordBoxes reads the raw
+                // chord events to position one diagram per chord
+                // change. Always overwrite (matches the
+                // beats/sections pattern above) so a song-change
+                // loading window doesn't leave the previous song's
+                // chord shapes scrolling behind the new chart.
+                state.chords = Array.isArray(bundle.chords) ? bundle.chords : [];
+                state.chordTemplates = Array.isArray(bundle.chordTemplates)
+                    ? bundle.chordTemplates : [];
+
+                // Rebuild trajectories only when the underlying
+                // chart arrays changed — either new song / arrangement
+                // or a master-difficulty swap in slopsmith core's
+                // _filteredNotes. Reference equality is enough
+                // because core reassigns (not mutates) on every
+                // filter rebuild.
+                if (bundle.notes !== _lastNotesRef || bundle.chords !== _lastChordsRef) {
+                    _lastNotesRef = bundle.notes;
+                    _lastChordsRef = bundle.chords;
+                    _rebuildChart(state, bundle.notes, bundle.chords);
+                }
+
+                const now = bundle.currentTime || 0;
+                drawFrame(ctx, state, canvas, now);
+                // Chord-box rendering on the secondary canvas
+                // (alleexx's contribution from renanboni's fork).
+                // Draw AFTER the note frame so on the rare visual
+                // overlap (compositor or stacking quirks) the
+                // chord boxes are last-painted, but they're on a
+                // separate DOM node so this is mostly stylistic.
+                // Best-effort: chordCanvas / chordCtx may be null
+                // if mountCanvas couldn't allocate the secondary
+                // context — drawChordBoxes guards on that.
+                if (chordCtx && chordCanvas) {
+                    // Resolve the same nStrings drawFrame just used
+                    // — see comment in drawFrame for the resolution
+                    // chain (state.stringCount → tuning length → 6).
+                    const ncs = (typeof state.stringCount === 'number' && state.stringCount > 0)
+                        ? state.stringCount
+                        : (state.tuning && state.tuning.length > 0 ? state.tuning.length : 6);
+                    drawChordBoxes(chordCtx, chordCanvas, state, ncs, now);
+                }
+            },
+            resize(/* w, h */) {
+                // Size from the canvas's own bounding rect — the w/h
+                // that highway.js hands over are scaled by its own
+                // render-scale for the renderer that owns the given
+                // #highway canvas, not our overlay.
+                if (!_isReady) return;
+                sizeCanvasToBox();
+            },
+            destroy() {
+                _isReady = false;
+                window.removeEventListener('resize', _onWinResize);
+                _teardown();
+            },
+        };
+    }
+
+    window.slopsmithViz_jumpingtab = createFactory;
+
+    console.log('[jumpingtab] plugin loaded (viz mode)');
 })();
